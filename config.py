@@ -37,6 +37,8 @@ CHAT_MODELS = ["google/gemini-3.8-flash", "google/gemini-3-flash", "google/gemin
                "openai/gpt-5-mini", "openai/gpt-4.1-mini", "openai/gpt-4o-mini"]
 # Поиск в интернете через Polza (немного дороже за запрос)
 POLZA_WEB_SEARCH = False
+# Если модель Polza сама понимает звук — слать голос прямо ей (на 1–4 с быстрее, без отдельного распознавания)
+POLZA_DIRECT_AUDIO = True
 # Максимум токенов в ответе (меньше — дешевле; Вася и так отвечает 1–3 фразами)
 ANSWER_MAX_TOKENS = 300
 

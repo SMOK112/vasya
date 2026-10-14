@@ -54,7 +54,10 @@ class Polza:
             except (TypeError, ValueError):
                 price = 1e9
             out.append((m.get("id", ""), "image" in mods, price))
+            self.audio_in[m.get("id", "")] = "audio" in mods
         return out
+
+    audio_in = {}             # модель -> понимает ли звук напрямую (тогда не нужен отдельный распознаватель)
 
     async def transcribe(self, wav: bytes, model: str, prompt: str = ""):
         s = await self.session()

@@ -765,6 +765,17 @@ POLZA_FORMAT = """
 """
 HALLUCINATION = re.compile(r"^\W*(большое спасибо|спасибо( за (внимание|просмотр))?|продолжение следует|"
                            r"субтитры.*|редактор субтитров.*|подписывайтесь.*|всем пока|до свидания)\W*$", re.I)
+FIRST_CLAUSE = re.compile(r"(.{18,}?,)(\s)", re.S)   # первую фразу можно начать озвучивать с запятой — быстрее
+AUDIO_FORMAT = """
+
+КАК ТЕБЕ ПРИХОДЯТ СООБЩЕНИЯ И КАК ОТВЕЧАТЬ (строго):
+Хозяин говорит голосом — тебе приходит аудио.
+Первая строка ответа — «Я: » и дословно, что сказал хозяин. Со следующей строки — твой ответ, он будет озвучен.
+Если в аудио нет речи (тишина, шум) или речь явно не к тебе — напиши только «Я: -».
+Если хозяин сказал только твоё имя — напиши «Я: Вась» и на следующей строке «[ЖДУ]».
+Если чтобы ответить, нужно посмотреть камерой (глянуть, прочитать, решить то, что перед ним) —
+напиши «Я: ...» и на следующей строке только «[ФОТО]».
+"""
 NAME_PREFIX = re.compile(r"^\W*(в[ао]с[яьеюи]\w*|васян\w*|васек|васёк)[\s,!.?—-]*", re.I)
 
 
@@ -789,12 +800,21 @@ async def pick_polza_models():
         cheap = cheap or sorted([(price, mid) for mid, img, price in allm if img])
         CHAT["bg"] = cheap[0][1] if cheap else CHAT["models"][0]
     log(f"Polza: фон смотрит {CHAT['bg']} ({have.get(CHAT['bg'], (0, 0))[1]:g} ₽/1М)")
+    if config.POLZA_DIRECT_AUDIO and PZ.audio_in.get(CHAT["models"][0]):
+        log(f"Polza: {CHAT['models'][0]} слышит звук сам — отдельное распознавание не нужно (быстрее)")
     log("Polza: модели по очереди:", ", ".join(f"{m} ({have.get(m, (0, 0))[1]:g} ₽/1М)" for m in CHAT["models"]))
 
 
 async def phrase_polza(audio, g, ptt, need_name, listener, T0=None):
     T0 = T0 or time.time()
     wav = to_wav(audio)
+    model0 = CHAT["models"][0]
+    if config.POLZA_DIRECT_AUDIO and PZ.audio_in.get(model0):
+        done = await ask_polza_audio(wav, g, ptt, need_name, listener, T0)
+        if done:
+            return
+        PZ.audio_in[model0] = False               # модель не приняла звук — дальше через распознаватель
+        log(f"   {model0} не принял звук — перехожу на отдельное распознавание")
     text, err, ok = "", None, False
     for model in config.STT_MODELS:
         try:
@@ -836,6 +856,107 @@ async def phrase_polza(audio, g, ptt, need_name, listener, T0=None):
     await ask_polza(text, photo, g, listener, T0=T0)
 
 
+async def ask_polza_audio(wav, g, ptt, need_name, listener, T0):
+    """Один запрос: модель сама слышит звук и сразу отвечает. False — модель звук не приняла."""
+    if time.time() - V.last > config.NEW_SESSION_AFTER_S:
+        V.phist = []
+    V.last = time.time()
+    mode = ("\n\nСЕЙЧАС ВКЛЮЧЁН ПРИЛИЧНЫЙ РЕЖИМ: никакого мата, общайся вежливо, но с юмором."
+            if V.polite else "\n\nРЕЖИМ БЕЗ ЦЕНЗУРЫ: общайся в стиле, описанном выше.")
+    seen = [(t, x) for t, x in SEEN if time.time() - t < config.BG_MEMORY_MIN * 60][-6:]
+    if seen:
+        mode += "\n\nЧТО ТЫ НЕДАВНО ВИДЕЛ КАМЕРОЙ (используй, только если к месту):\n" + \
+                "\n".join(time.strftime("[%H:%M] ", time.localtime(t)) + x for t, x in seen)
+    note = ("Отвечай, только если он обратился к тебе по имени Вася, иначе «Я: -»." if need_name
+            else "Он обращается к тебе.")
+    content = [{"type": "input_audio", "input_audio": {"data": base64.b64encode(wav).decode(), "format": "wav"}},
+               {"type": "text", "text": "Голосовое от хозяина. " + note}]
+    messages = [{"role": "system", "content": PERSONA + mode + AUDIO_FORMAT}] + V.phist + \
+               [{"role": "user", "content": content}]
+    model = CHAT["models"][0]
+    buf, heard, first_line, first, answer = "", None, False, True, []
+    try:
+        async for piece in PZ.chat_stream(model, messages, max_tokens=config.ANSWER_MAX_TOKENS):
+            if V.gen != g:
+                return True
+            buf += piece
+            if not first_line:
+                if "\n" not in buf:
+                    continue
+                line, buf = buf.split("\n", 1)
+                first_line = True
+                m = re.match(r"^\W*я\s*:\s*(.*)$", line.strip(), re.I)
+                heard = m.group(1).strip() if m else ""
+                if not m:
+                    buf = line + "\n" + buf
+                log(f"   ⏱ услышал за {time.time() - T0:.1f} с ({model})")
+                if heard in ("-", "—"):
+                    status("Слушаю")
+                    return True
+                if heard:
+                    ui("Ты", heard)
+                    if handle_command(heard):
+                        return True
+            if "[ЖДУ]" in buf:
+                if listener is not None and not ptt:
+                    listener.awake_until = time.time() + config.AWAKE_S
+                status("Слушаю! Говори")
+                return True
+            if "[ФОТО]" in buf:
+                break
+            while True:
+                m = SENT_END.match(buf) or (FIRST_CLAUSE.match(buf) if first else None)
+                if not m:
+                    break
+                sentence, buf = m.group(1).strip(), buf[m.end():]
+                if sentence:
+                    if first:
+                        log(f"   ⏱ первая фраза ответа через {time.time() - T0:.1f} с ({model}, звук напрямую)")
+                        first = False
+                    ui("Вася", sentence)
+                    say(sentence, g)
+                    answer.append(sentence)
+    except PolzaError as e:
+        if e.status == 400 and not answer:
+            log("   звук напрямую не прошёл:", str(e)[:200])
+            return False
+        log(f"Ошибка Polza ({model}):", str(e)[:300])
+        human, spoken = polza_human(e)
+        ui("Ошибка", human + "\n\n" + str(e)[:300])
+        say(spoken)
+        return True
+    except Exception as e:
+        log(f"Ошибка Polza ({model}):", type(e).__name__, str(e)[:300])
+        if answer:
+            return True
+        return False
+    if not first_line:                                  # ответ одной строкой
+        m = re.match(r"^\W*я\s*:\s*(.*)$", buf.strip(), re.I | re.S)
+        if m:
+            heard, buf = m.group(1).strip(), ""
+            if heard in ("-", "—", ""):
+                status("Слушаю")
+                return True
+            ui("Ты", heard)
+            if handle_command(heard):
+                return True
+    if "[ФОТО]" in buf:
+        photo = await take_photo()
+        if V.gen == g:
+            await ask_polza(heard or "Глянь, что тут.", photo, g, listener, photo_retry=False, T0=T0)
+        return True
+    if buf.strip() and V.gen == g:
+        ui("Вася", buf.strip())
+        say(buf.strip(), g)
+        answer.append(buf.strip())
+    if answer and V.gen == g:
+        V.phist += [{"role": "user", "content": heard or "(голосовое)"},
+                    {"role": "assistant", "content": " ".join(answer)}]
+        V.phist = V.phist[-config.HISTORY_TURNS * 2:]
+        log(f"   Polza: потрачено с запуска ≈ {PZ.spent:.2f} ₽")
+    return True
+
+
 async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None):
     T0 = T0 or time.time()
     first = True
@@ -868,7 +989,7 @@ async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None):
                 if "[ФОТО]" in buf:
                     break
                 while True:
-                    m = SENT_END.match(buf)
+                    m = SENT_END.match(buf) or (FIRST_CLAUSE.match(buf) if first else None)
                     if not m:
                         break
                     sentence, buf = m.group(1).strip(), buf[m.end():]
