@@ -756,7 +756,7 @@ async def ask(parts, note, photo, g, listener, heard_known=None, photo_retry=Tru
 from polza import Polza, PolzaError, human_error as polza_human, retryable as polza_retryable
 
 PZ = Polza(POLZA_KEY) if POLZA_KEY else None
-CHAT = {"models": list(config.CHAT_MODELS), "bg": config.BG_MODEL}
+CHAT = {"models": list(config.CHAT_MODELS), "bg": config.BG_MODEL, "solve": list(config.SOLVE_MODELS)}
 SEEN = []                     # (время, что видно) — заметки фонового режима
 BG = {"busy": False}
 BG_PROMPT = ("Ты — глаза голосового помощника. Посмотри на кадр с камеры очков и ответь ОДНОЙ строкой строго так:\n"
@@ -839,7 +839,9 @@ async def pick_polza_models():
         chosen = [mid for _, mid in cands[:3]]
     if chosen:
         CHAT["models"] = chosen
-    if not CHAT["bg"] or CHAT["bg"] not in have:
+    CHAT["solve"] = [m for m in config.SOLVE_MODELS if m in have and have[m][0]] or list(CHAT["models"])
+    log("Polza: задания с фото решает", ", ".join(CHAT["solve"][:2]))
+    if not CHAT["bg"] or CHAT["bg"] not in have or not have[CHAT["bg"]][0]:
         cheap = sorted([(price, mid) for mid, img, price in allm
                         if img and any(k in mid for k in ("flash", "mini", "lite", "nano", "luna"))])
         cheap = cheap or sorted([(price, mid) for mid, img, price in allm if img])
@@ -1036,7 +1038,7 @@ async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None, framing
     messages = [{"role": "system", "content": PERSONA + mode + POLZA_FORMAT}] + V.phist + \
                [{"role": "user", "content": content}]
     status("Думаю...")
-    models = list(CHAT["models"])
+    models = list(CHAT["solve"] if photo else CHAT["models"])   # с фото — модель поумнее, болтать — подешевле
     answer, said, i = [], False, 0
     while i < len(models):
         buf = ""

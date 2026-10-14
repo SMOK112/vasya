@@ -33,9 +33,11 @@ NEW_SESSION_AFTER_S = 600
 # Распознавание речи — по очереди, если первая не ответила
 STT_MODELS = ["openai/whisper-large-v3-turbo", "openai/gpt-4o-mini-transcribe", "openai/whisper-1"]
 # Мозг — берутся те, что реально есть на Polza и понимают фото; если ни одной — самая дешёвая с фото
-# Первой лучше модель, которая сама слышит звук (Gemini Flash) — так быстрее: голос сразу идёт в неё.
-CHAT_MODELS = ["google/gemini-3.8-flash", "google/gemini-3-flash", "google/gemini-2.5-flash",
-               "openai/gpt-6-luna", "openai/gpt-5-mini", "openai/gpt-4.1-mini", "openai/gpt-4o-mini"]
+# Болтовня: первой — модель, которая сама слышит звук (Gemini Flash), так быстрее. 2.5 Flash — дешёвая и норм.
+CHAT_MODELS = ["google/gemini-2.5-flash", "google/gemini-3.8-flash", "openai/gpt-6-luna",
+               "openai/gpt-5-mini", "openai/gpt-4o-mini"]
+# Решение заданий с фото — модель поумнее (дороже, но таких запросов мало)
+SOLVE_MODELS = ["google/gemini-3.8-flash", "google/gemini-2.5-flash", "openai/gpt-5-mini"]
 # Поиск в интернете через Polza (немного дороже за запрос)
 POLZA_WEB_SEARCH = False
 # Если модель Polza сама понимает звук — слать голос прямо ей (на 1–4 с быстрее, без отдельного распознавания)
@@ -48,7 +50,7 @@ ANSWER_MAX_TOKENS = 300
 # самая дешёвая модель с картинками пишет одну строчку «что вокруг», и Вася держит это в памяти.
 # Фото не сохраняются — только короткие заметки, и только последние.
 BG_INTERVAL_S = 30
-BG_MODEL = ""              # пусто — самая дешёвая модель Polza с картинками (обычно GPT-6 Luna)
+BG_MODEL = "openai/gpt-6-luna"   # фоновые кадры; пусто — самая дешёвая модель Polza с картинками
 # Если на фоновом кадре задание — Вася сам спросит «решать?», ждёт да/нет без имени,
 # а при «да» фоткает в хорошем качестве и, если задание не влезло, говорит как поправить камеру (до 3 раз)
 BG_MEMORY_MIN = 15         # сколько минут помнить увиденное
