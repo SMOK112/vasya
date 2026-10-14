@@ -359,29 +359,37 @@ if wake_model is None:
     log("!!! Нет модели Vosk — имя будет проверять Gemini (дороже). Запусти deploy.sh ещё раз.")
 
 NAMES = {n.lower().replace("ё", "е") for n in config.WAKE_NAMES}
+MYNAMES = {n.lower().replace("ё", "е") for n in getattr(config, "NAME_ALIASES", [])}
 DECOYS = ["вас", "ваш", "ваша", "наш", "нас", "раз", "класс", "часть", "вес", "весь", "лось", "гусь", "[unk]"]
 
 
 class WakeSpotter:
-    """Постоянно слушает только имя — как «Алиса»."""
+    """Постоянно слушает имя Васи и имя хозяина. Возвращает 'vasya', 'name' или None."""
 
     def __init__(self):
-        words = sorted(NAMES) + [w for w in DECOYS if w not in NAMES]
+        words = sorted(NAMES | MYNAMES) + [w for w in DECOYS if w not in NAMES and w not in MYNAMES]
         self.rec = vosk.KaldiRecognizer(wake_model, SR, json.dumps(words, ensure_ascii=False))
         self.hit = False
+
+    def _label(self, words):
+        if any(w in NAMES for w in words):
+            return "vasya"
+        if any(w in MYNAMES for w in words):
+            return "name"
+        return None
 
     def __call__(self, block):
         pcm = (np.clip(block, -1, 1) * 32767).astype("<i2").tobytes()
         if self.rec.AcceptWaveform(pcm):
-            text = json.loads(self.rec.Result()).get("text", "")
-            fired = not self.hit and any(w in NAMES for w in text.split())
+            lab = None if self.hit else self._label(json.loads(self.rec.Result()).get("text", "").split())
             self.hit = False
-            return fired
-        part = json.loads(self.rec.PartialResult()).get("partial", "")
-        if not self.hit and any(w in NAMES for w in part.split()):
+            return lab
+        part = json.loads(self.rec.PartialResult()).get("partial", "").split()
+        lab = self._label(part)
+        if lab and not self.hit:
             self.hit = True
-            return True
-        return False
+            return lab
+        return None
 
     def reset(self):
         self.rec.Reset()
@@ -453,6 +461,19 @@ class Listener:
         self.ptt = False
         self.ptt_buf = []
         self.was_speaking = False
+        self.ctx = []                  # последние секунды звука вокруг (в памяти, перезатираются)
+        self.ctx_len = 0
+        self.quiet_until = 0.0         # окно после имени хозяина: слушаю разговор, сам молчу
+
+    def context_audio(self):
+        return np.concatenate(self.ctx) if self.ctx else None
+
+    def _remember(self, block):
+        self.ctx.append(block)
+        self.ctx_len += len(block)
+        cap = int(config.CONTEXT_SECONDS * SR)
+        while self.ctx_len > cap and len(self.ctx) > 1:
+            self.ctx_len -= len(self.ctx.pop(0))
 
     def reset_ears(self):
         self.vad.reset()
@@ -494,12 +515,18 @@ class Listener:
             if self.was_speaking:
                 self.was_speaking = False
                 status("Слушаю")
-            if self.spotter is not None and self.spotter(block):
-                if self.in_speech:
-                    self.wake_in_phrase = True
-                else:
-                    self.awake_until = time.time() + config.AWAKE_S
-                wake_ping()
+            self._remember(block)
+            if self.spotter is not None:
+                lab = self.spotter(block)
+                if lab == "vasya":
+                    if self.in_speech:
+                        self.wake_in_phrase = True
+                    else:
+                        self.awake_until = time.time() + config.AWAKE_S
+                    wake_ping()
+                elif lab == "name" and not self.in_speech:
+                    self.quiet_until = time.time() + config.HELP_WINDOW_S   # обращаются ко мне — слушаю, молчу
+                    status("Слушаю разговор")
             p = self.vad(block)
             if not self.in_speech:
                 self.pre = (self.pre + [block])[-self.PREROLL:]
@@ -525,11 +552,14 @@ class Listener:
         if self.voiced * BLOCK_S < 0.25:        # щелчок, кашель
             return
         direct = self.wake_in_phrase or self.t0 <= self.awake_until
+        quiet = self.t0 <= self.quiet_until
         if direct:
             self.awake_until = 0.0
             spawn(handle_phrase(audio, wake_hit=self.wake_in_phrase, listener=self))
+        elif quiet:
+            spawn(handle_phrase(audio, quiet=True, listener=self))   # окно разговора: отвечаю только на просьбу
         elif self.spotter is None:
-            spawn(handle_phrase(audio, need_name=True))   # без Vosk имя проверяет сам Gemini
+            spawn(handle_phrase(audio, need_name=True))
 
 
 _tasks = set()
@@ -600,15 +630,19 @@ def only_names(text):
     return bool(w) and all(x in NAMES for x in w)
 
 
-async def handle_phrase(audio, ptt=False, wake_hit=False, need_name=False, listener=None):
+HELP_REPLY = re.compile(r"(что (мне )?(ответить|сказать|отвечать)|помоги ответить|как ответить|"
+                        r"подскажи что|что ему (ответить|сказать)|выручай|что говорить)")
+
+
+async def handle_phrase(audio, ptt=False, wake_hit=False, need_name=False, quiet=False, listener=None):
     stop_talking()                       # новый вопрос — старый ответ больше не нужен
     g = V.gen
     status("Думаю...")
     dur = len(audio) / SR
     T0 = time.time()
-    # грубая расшифровка Vosk нужна Gemini-режиму; в режиме Polza — только чтобы не платить за одно «Вась»
+    # грубая расшифровка Vosk: Gemini-режиму — всегда; в Polza — для «только Вась», просьбы о помощи и тихого окна
     rough = ""
-    if BRAIN != "polza" or (wake_hit and not ptt and dur < 1.6):
+    if BRAIN != "polza" or quiet or (wake_hit and not ptt and dur < 1.6):
         rough = await asyncio.get_running_loop().run_in_executor(None, rough_text, audio)
         if rough:
             log("   (Vosk расслышал:", rough + ")")
@@ -616,6 +650,14 @@ async def handle_phrase(audio, ptt=False, wake_hit=False, need_name=False, liste
         if listener is not None:          # сказал только «Вась» — ждём вопрос
             listener.awake_until = time.time() + config.AWAKE_S
         status("Слушаю! Говори")
+        return
+    # просьба подсказать ответ в разговоре — берём последние секунды вокруг и предлагаем реплику
+    if (quiet or wake_hit) and BRAIN == "polza" and HELP_REPLY.search(rough.lower()):
+        return await reply_help(g, listener)
+    if quiet:                             # тихое окно: обращались к хозяину, но помощи не просил — молчу
+        if listener is not None:
+            listener.quiet_until = time.time() + config.HELP_WINDOW_S
+        status("Слушаю разговор")
         return
     if BRAIN == "polza":
         return await phrase_polza(audio, g, ptt, need_name, listener, T0)
@@ -1106,6 +1148,50 @@ async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None, framing
                     {"role": "assistant", "content": MARKS.sub("", " ".join(answer))}]
         V.phist = V.phist[-config.HISTORY_TURNS * 2:]
         log(f"   Polza: потрачено с запуска ≈ {PZ.spent:.2f} ₽")
+
+async def reply_help(g, listener):
+    """Хозяину трудно в разговоре — берём последние секунды вокруг и подсказываем, что ответить."""
+    audio = listener.context_audio() if listener is not None else None
+    if audio is None or len(audio) < SR * 1.5:
+        say("Я ещё мало что расслышал, дай поговорить чуток.")
+        return
+    status("Думаю, что сказать...")
+    wav = to_wav(audio[-int(config.CONTEXT_SECONDS * SR):])
+    note = ("Хозяину трудно подбирать слова в живом разговоре, и он попросил тебя помочь. "
+            "Это запись последних секунд разговора вокруг него. Пойми, что ему только что сказали или о чём спросили, "
+            "и предложи, ЧТО ЕМУ ОТВЕТИТЬ: одну-две короткие фразы прямо от его лица, которые он может просто повторить. "
+            "Без вступлений и без мата, говори сразу реплику. Если непонятно, кому и что отвечать — скажи это одной фразой.")
+    content = [{"type": "input_audio", "input_audio": {"data": base64.b64encode(wav).decode(), "format": "wav"}},
+               {"type": "text", "text": note}]
+    messages = [{"role": "system", "content": "Ты — незаметный суфлёр в ухе у хозяина. Коротко, по делу, спокойно."},
+                {"role": "user", "content": content}]
+    model = CHAT["models"][0]
+    buf, first = "", True
+    try:
+        async for piece in PZ.chat_stream(model, messages, max_tokens=config.ANSWER_MAX_TOKENS):
+            if V.gen != g:
+                return
+            buf += piece
+            while True:
+                m = SENT_END.match(buf) or (FIRST_CLAUSE.match(buf) if first else None)
+                if not m:
+                    break
+                sentence, buf = m.group(1).strip(), buf[m.end():]
+                if sentence:
+                    first = False
+                    ui("Суфлёр", sentence)
+                    say(sentence, g)
+        if buf.strip() and V.gen == g:
+            ui("Суфлёр", buf.strip())
+            say(buf.strip(), g)
+    except Exception as e:
+        log("Суфлёр: ошибка:", type(e).__name__, str(e)[:200])
+        human, spoken = polza_human(e)
+        ui("Ошибка", human)
+        say(spoken)
+    if listener is not None:
+        listener.quiet_until = time.time() + config.HELP_WINDOW_S
+
 
 async def handle_bg(data_url):
     """Фоновый кадр: одна строчка «что вокруг» в память. Сам Вася при этом молчит."""
