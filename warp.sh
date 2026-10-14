@@ -48,7 +48,9 @@ CODE=$(curl -s -o /tmp/gemini_test.json -w '%{http_code}' --max-time 30 -x socks
   -d '{"contents":[{"parts":[{"text":"Ответь одним словом: ок"}]}]}' \
   "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent" || true)
 echo "Ответ Gemini: HTTP $CODE"
-if [ "$CODE" != "200" ]; then
+if [ "$CODE" = "429" ]; then
+  echo "Google пустил (страна ок), просто кончился дневной лимит этой модели — Вася сам возьмёт другую."
+elif [ "$CODE" != "200" ]; then
   head -c 400 /tmp/gemini_test.json; echo
   rm -f /tmp/gemini_test.json
   die "Через WARP Gemini тоже не пустил. Скинь этот текст в чат — есть план Б."

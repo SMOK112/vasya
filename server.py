@@ -133,6 +133,16 @@ def explain_error(e):
     return ("Ошибка Gemini — скинь этот текст в чат.", "Хуйня какая-то с мозгом, глянь экран.")
 
 
+COOLDOWN = {}          # модель -> до какого времени не трогать (кончился лимит)
+
+
+def models_now():
+    """Модели по порядку, но те, у которых кончился лимит, — в конец."""
+    now = time.time()
+    ok = [m for m in config.GEMINI_MODELS if COOLDOWN.get(m, 0) <= now]
+    return ok + [m for m in config.GEMINI_MODELS if m not in ok]
+
+
 def retryable(e):
     low = str(e).lower()
     return any(k in low for k in ("503", "unavailable", "overloaded", "429", "resource_exhausted",
@@ -553,7 +563,7 @@ async def ask(parts, note, photo, g, listener, heard_known=None, photo_retry=Tru
     user_parts.append(types.Part(text=note))
     contents = V.history + [types.Content(role="user", parts=user_parts)]
 
-    models = list(config.GEMINI_MODELS)
+    models = models_now()
     heard, answer, said = heard_known, [], False
     i = 0
     while i < len(models):
@@ -638,6 +648,8 @@ async def ask(parts, note, photo, g, listener, heard_known=None, photo_retry=Tru
                 log("   Выключаю поиск и пробую снова")
                 V.search = False
                 continue
+            if "429" in low or "resource_exhausted" in low or "quota" in low:
+                COOLDOWN[model] = time.time() + 30 * 60      # лимит кончился — полчаса не трогаем
             if not said and retryable(e) and i + 1 < len(models):
                 log("   Пробую модель", models[i + 1])
                 i += 1
@@ -714,9 +726,19 @@ async def on_startup(app):
     app["tts"] = asyncio.get_running_loop().create_task(tts_worker())
     log("Проверяю Gemini...")
     try:
-        r = await client.aio.models.generate_content(model=config.GEMINI_MODELS[0],
-                                                     contents="Ответь одним словом: ок")
-        log("Gemini на связи:", (r.text or "").strip()[:30])
+        for model in config.GEMINI_MODELS:
+            try:
+                r = await client.aio.models.generate_content(model=model, contents="Ответь одним словом: ок")
+                log(f"Gemini на связи ({model}):", (r.text or "").strip()[:30])
+                return
+            except Exception as e:
+                low = str(e).lower()
+                if "429" in low or "quota" in low or "resource_exhausted" in low:
+                    COOLDOWN[model] = time.time() + 30 * 60
+                    log(f"   {model}: кончился бесплатный лимит, беру следующую")
+                    continue
+                raise
+        log("!!! У всех моделей кончился бесплатный лимит — подожди или поменяй GEMINI_MODELS в config.py")
     except Exception as e:
         log("!!! Gemini не отвечает:", type(e).__name__, str(e)[:300])
         log("!!!", explain_error(e)[0])
