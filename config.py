@@ -13,7 +13,7 @@ WEB_SEARCH = True
 WAKE_NAMES = ["вася", "вась", "васёк", "васек", "васян"]
 VOSK_MODEL = "vosk-model-small-ru-0.22"
 # Сколько секунд после «Вась» ждать вопрос без имени
-AWAKE_S = 8.0
+AWAKE_S = 18.0
 
 # Голос (Microsoft edge-tts). Мужские: ru-RU-DmitryNeural, женские: ru-RU-SvetlanaNeural
 VOICE = "ru-RU-DmitryNeural"
