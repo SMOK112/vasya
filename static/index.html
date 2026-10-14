@@ -130,8 +130,18 @@ async function start() {
   connect();
 }
 
-function connect() {
+async function connect() {
   status('Подключаюсь к Васе...'); dot('');
+  try {
+    const r = await fetch('/check?k=' + encodeURIComponent(KEY), { cache: 'no-store' });
+    if (r.status === 403) {
+      dot('off');
+      status(KEY ? 'Ключ не подошёл — открой ссылку с ?k= из окна установки заново'
+                 : 'Нужна ссылка с ключом (?k=...) — возьми её из окна установки');
+      store('vasya_key', ''); KEY = '';
+      return;                                   // без ключа долбиться смысла нет
+    }
+  } catch (e) { dot('off'); status('Сервер не отвечает — переподключаюсь...'); setTimeout(connect, 3000); return; }
   ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws?k=' + encodeURIComponent(KEY));
   let opened = false;
   ws.binaryType = 'arraybuffer';

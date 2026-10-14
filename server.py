@@ -672,6 +672,13 @@ async def index(request):
                             headers={"Cache-Control": "no-store"})
 
 
+async def check(request):
+    ok = not TOKEN or secrets.compare_digest(request.query.get("k", ""), TOKEN)
+    if not ok:
+        log("Неверный ключ в ссылке:", request.headers.get("X-Forwarded-For", request.remote))
+    return web.json_response({"ok": ok}, status=200 if ok else 403)
+
+
 async def ws_handler(request):
     if TOKEN and not secrets.compare_digest(request.query.get("k", ""), TOKEN):
         log("Чужой без ключа:", request.headers.get("X-Forwarded-For", request.remote))
@@ -685,6 +692,7 @@ async def ws_handler(request):
     listener = None
     try:
         async for msg in ws:
+          try:
             if msg.type == WSMsgType.BINARY:
                 if listener is not None:
                     listener.feed(np.frombuffer(msg.data, dtype="<i2").astype(np.float32) / 32768.0)
@@ -692,6 +700,7 @@ async def ws_handler(request):
                 m = json.loads(msg.data)
                 t = m.get("type")
                 if t == "hello":
+                    log("   привет от телефона:", m)
                     listener = Listener(m.get("rate", 48000))
                     log(f"Микрофон телефона: {listener.rate} Гц")
                     status("Слушаю. Скажи «Вась» или держи кнопку")
@@ -715,6 +724,9 @@ async def ws_handler(request):
                             spawn(handle_look(data))
                     elif m.get("id") == V.snap_id and V.snap_fut is not None and not V.snap_fut.done():
                         V.snap_fut.set_result(data)
+          except Exception:
+            import traceback
+            log("!!! Ошибка при обработке данных телефона:\n" + traceback.format_exc())
     finally:
         if V.ws is ws:
             V.ws = None
@@ -748,6 +760,7 @@ def main():
     app = web.Application(client_max_size=20 * 1024 * 1024)
     app.router.add_get("/", index)
     app.router.add_get("/ws", ws_handler)
+    app.router.add_get("/check", check)
     app.on_startup.append(on_startup)
     log(f"Вася слушает на {HOST}:{PORT}")
     web.run_app(app, host=HOST, port=PORT, access_log=None, print=None)
