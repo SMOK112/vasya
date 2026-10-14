@@ -161,5 +161,6 @@ echo
 echo "    https://$DOMAIN/?k=$TOKEN"
 echo
 echo "Ссылку с ключом никому не давай. Телефон запомнит ключ, потом хватит https://$DOMAIN"
+echo "QR-код и ссылка ещё раз:  bash $APP/link.sh"
 echo "Логи Васи:   journalctl -u vasya -f"
 echo "Обновить:    bash $APP/update.sh"

@@ -65,7 +65,7 @@ let cam = null, camOn = false;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; } }
 // ключ доступа приходит в ссылке (?k=...) один раз, дальше помним его на телефоне
-let KEY = new URLSearchParams(location.search).get('k') || store('vasya_key') || '';
+let KEY = (new URLSearchParams(location.search).get('k') || store('vasya_key') || '').trim();
 if (KEY) { store('vasya_key', KEY); if (location.search) history.replaceState(null, '', location.pathname); }
 
 function status(t) { $('status').textContent = t; }
@@ -136,9 +136,9 @@ async function connect() {
     const r = await fetch('/check?k=' + encodeURIComponent(KEY), { cache: 'no-store' });
     if (r.status === 403) {
       dot('off');
-      status(KEY ? 'Ключ не подошёл — открой ссылку с ?k= из окна установки заново'
-                 : 'Нужна ссылка с ключом (?k=...) — возьми её из окна установки');
+      status(KEY ? 'Ключ не подошёл — вставь правильный' : 'Нужен ключ — вставь его (или открой ссылку с ?k=)');
       store('vasya_key', ''); KEY = '';
+      askKey();
       return;                                   // без ключа долбиться смысла нет
     }
   } catch (e) { dot('off'); status('Сервер не отвечает — переподключаюсь...'); setTimeout(connect, 3000); return; }
@@ -177,6 +177,22 @@ function play(buf) {
     sources.push(s); dot('talk');
     s.onended = () => { sources = sources.filter(x => x !== s); if (!sources.length) idle(); };
   }).catch(e => console.warn('mp3', e));
+}
+// окошко для ключа, если открыли без ссылки
+function askKey() {
+  if ($('keybox')) return;
+  const box = document.createElement('div');
+  box.id = 'keybox'; box.className = 'row';
+  box.innerHTML = '<input id="keyin" placeholder="ключ из установки" autocomplete="off" ' +
+    'style="flex:2;font:16px system-ui;padding:14px;border-radius:14px;border:1px solid #444;background:#1b1d21;color:#eef0f3">' +
+    '<button id="keyok" style="flex:1">ОК</button>';
+  $('log').before(box);
+  $('keyok').onclick = () => {
+    let v = $('keyin').value.trim();
+    const m = v.match(/[?&]k=([^&\s]+)/); if (m) v = m[1];   // можно вставить всю ссылку целиком
+    if (!v) return;
+    KEY = v; store('vasya_key', v); box.remove(); connect();
+  };
 }
 function idle() {
   dot('on');

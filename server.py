@@ -672,15 +672,21 @@ async def index(request):
                             headers={"Cache-Control": "no-store"})
 
 
+def key_ok(k):
+    return not TOKEN or secrets.compare_digest(k.strip().lower(), TOKEN.strip().lower())
+
+
 async def check(request):
-    ok = not TOKEN or secrets.compare_digest(request.query.get("k", ""), TOKEN)
+    k = request.query.get("k", "")
+    ok = key_ok(k)
     if not ok:
-        log("Неверный ключ в ссылке:", request.headers.get("X-Forwarded-For", request.remote))
+        who = request.headers.get("X-Forwarded-For", request.remote)
+        log("Открыли без ключа:" if not k.strip() else f"Неверный ключ ({len(k)} симв.):", who)
     return web.json_response({"ok": ok}, status=200 if ok else 403)
 
 
 async def ws_handler(request):
-    if TOKEN and not secrets.compare_digest(request.query.get("k", ""), TOKEN):
+    if not key_ok(request.query.get("k", "")):
         log("Чужой без ключа:", request.headers.get("X-Forwarded-For", request.remote))
         return web.Response(status=403, text="нужен ключ")
     ws = web.WebSocketResponse(heartbeat=20, max_msg_size=0)
