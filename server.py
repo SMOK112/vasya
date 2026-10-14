@@ -109,6 +109,7 @@ class State:
         self.snap_fut = None
         self.greeted = 0.0
         self.phist = []              # история для Polza (текстом)
+        self.listener = None
 
 
 V = State()
@@ -222,6 +223,9 @@ def fire(obj):
 
 
 def ui(who, text):
+    text = MARKS.sub("", text).strip()
+    if not text:
+        return
     log(f"{who}:", text)
     fire({"type": "log", "who": who, "text": text})
 
@@ -234,8 +238,11 @@ def status(text):
 import edge_tts
 
 
+MARKS = re.compile(r"\[(ЖДУ|ФОТО|РЕШАЮ|ПЕРЕСНЯТЬ)\]")
+
+
 def clean_for_tts(text):
-    text = re.sub(r"\[(ЖДУ|ФОТО)\]", "", text)
+    text = MARKS.sub("", text)
     text = re.sub(r"[*_#`>\[\]]", "", text)
     text = re.sub(r"[\U0001F300-\U0001FAFF☀-➿]", "", text)
     text = text.replace("—", ", ").replace("…", ".")
@@ -628,7 +635,7 @@ async def handle_look(photo):
     g = V.gen
     ui("Ты", "[фото] Глянь, чё тут")
     if BRAIN == "polza":
-        return await ask_polza("Глянь, чё тут. Если это задание — реши и скажи ответ.", photo, g, None)
+        return await ask_polza("Глянь, чё тут. Если это задание — реши и скажи ответ.", photo, g, None, framing=2)
     await ask([], "Хозяин показывает тебе камеру: глянь, чё тут. Если это задание — реши и скажи ответ.",
               photo, g, None, heard_known="[фото] Глянь, чё тут")
 
@@ -752,9 +759,47 @@ PZ = Polza(POLZA_KEY) if POLZA_KEY else None
 CHAT = {"models": list(config.CHAT_MODELS), "bg": config.BG_MODEL}
 SEEN = []                     # (время, что видно) — заметки фонового режима
 BG = {"busy": False}
-BG_PROMPT = ("Ты — глаза голосового помощника. По кадру с камеры очков напиши одну короткую строку, до пятнадцати слов: "
-             "где хозяин, что перед ним, есть ли рядом люди и чем они заняты, есть ли текст или задание. "
-             "Без догадок о том, кто эти люди. Если кадр тёмный или смазанный — напиши только «-».")
+BG_PROMPT = ("Ты — глаза голосового помощника. Посмотри на кадр с камеры очков и ответь ОДНОЙ строкой строго так:\n"
+             "ЗАДАНИЕ: да | <что видно, до пятнадцати слов>\n"
+             "или\n"
+             "ЗАДАНИЕ: нет | <что видно, до пятнадцати слов>\n"
+             "«да» — только если в кадре учебное задание, задача, пример, тест или вопрос (в тетради, на доске, в учебнике, "
+             "на экране). Что видно — где хозяин, что перед ним, есть ли рядом люди и чем заняты, без догадок, кто они. "
+             "Если кадр тёмный или смазанный — напиши только «-».")
+OFFER = {"until": 0.0, "next": 0.0}      # Вася предложил решить задание и ждёт «да/нет»
+OFFER_LINES = ["Опа, вижу задание. Решаем или сам будешь мучиться?",
+               "Слышь, там задание. Порешать за тебя?",
+               "Вижу задачку. Решить, или ты сегодня сам умный?"]
+OFFER_NOTE = (" Ты только что заметил камерой задание и спросил хозяина, решать ли его. "
+              "Если он согласен (да, давай, го, ага, реши, конечно и тому подобное) — ответь только «[РЕШАЮ]». "
+              "Если отказывается — коротко и смешно ответь.")
+FRAMING_RULE = (" Если задание на фото видно не целиком, обрезано, размыто или слишком мелко, чтобы прочитать, — не решай, "
+                "а одной-двумя фразами скажи, как сдвинуть камеру (ближе, дальше, левее, правее, выше, ниже), "
+                "и в самом конце поставь «[ПЕРЕСНЯТЬ]». Если всё видно — реши: сначала ответ, потом коротко как.")
+
+
+def offer_pending():
+    return time.time() < OFFER["until"]
+
+
+async def wait_quiet(extra=0.0):
+    """Подождать, пока Вася договорит (и ещё extra секунд)."""
+    for _ in range(300):
+        if not is_speaking():
+            break
+        await asyncio.sleep(0.2)
+    if extra:
+        await asyncio.sleep(extra)
+
+
+async def solve_task(g, listener):
+    OFFER["until"] = 0.0
+    photo = await take_photo()
+    if photo is None or V.gen != g:
+        if photo is None:
+            say("Камера не дала кадр, попробуй ещё раз.")
+        return
+    await ask_polza("Реши задание, которое видно на фото.", photo, g, listener, framing=3)
 POLZA_FORMAT = """
 
 КАК ТЕБЕ ПРИХОДЯТ СООБЩЕНИЯ:
@@ -796,7 +841,7 @@ async def pick_polza_models():
         CHAT["models"] = chosen
     if not CHAT["bg"] or CHAT["bg"] not in have:
         cheap = sorted([(price, mid) for mid, img, price in allm
-                        if img and any(k in mid for k in ("flash", "mini", "lite", "nano"))])
+                        if img and any(k in mid for k in ("flash", "mini", "lite", "nano", "luna"))])
         cheap = cheap or sorted([(price, mid) for mid, img, price in allm if img])
         CHAT["bg"] = cheap[0][1] if cheap else CHAT["models"][0]
     log(f"Polza: фон смотрит {CHAT['bg']} ({have.get(CHAT['bg'], (0, 0))[1]:g} ₽/1М)")
@@ -850,10 +895,13 @@ async def phrase_polza(audio, g, ptt, need_name, listener, T0=None):
             listener.awake_until = time.time() + config.AWAKE_S
         status("Слушаю! Говори")
         return
+    if offer_pending():
+        await ask_polza(text, None, g, listener, T0=T0, offered=True)
+        return
     photo = await take_photo() if LOOK.search(text.lower()) else None
     if V.gen != g:
         return
-    await ask_polza(text, photo, g, listener, T0=T0)
+    await ask_polza(text, photo, g, listener, T0=T0, framing=2 if photo else 0)
 
 
 async def ask_polza_audio(wav, g, ptt, need_name, listener, T0):
@@ -869,6 +917,9 @@ async def ask_polza_audio(wav, g, ptt, need_name, listener, T0):
                 "\n".join(time.strftime("[%H:%M] ", time.localtime(t)) + x for t, x in seen)
     note = ("Отвечай, только если он обратился к тебе по имени Вася, иначе «Я: -»." if need_name
             else "Он обращается к тебе.")
+    offered = offer_pending()
+    if offered:
+        note += OFFER_NOTE
     content = [{"type": "input_audio", "input_audio": {"data": base64.b64encode(wav).decode(), "format": "wav"}},
                {"type": "text", "text": "Голосовое от хозяина. " + note}]
     messages = [{"role": "system", "content": PERSONA + mode + AUDIO_FORMAT}] + V.phist + \
@@ -902,7 +953,7 @@ async def ask_polza_audio(wav, g, ptt, need_name, listener, T0):
                     listener.awake_until = time.time() + config.AWAKE_S
                 status("Слушаю! Говори")
                 return True
-            if "[ФОТО]" in buf:
+            if "[ФОТО]" in buf or "[РЕШАЮ]" in buf:
                 break
             while True:
                 m = SENT_END.match(buf) or (FIRST_CLAUSE.match(buf) if first else None)
@@ -940,10 +991,15 @@ async def ask_polza_audio(wav, g, ptt, need_name, listener, T0):
             ui("Ты", heard)
             if handle_command(heard):
                 return True
+    if "[РЕШАЮ]" in buf and offered:
+        await solve_task(g, listener)
+        return True
+    if offered:
+        OFFER["until"] = 0.0
     if "[ФОТО]" in buf:
         photo = await take_photo()
         if V.gen == g:
-            await ask_polza(heard or "Глянь, что тут.", photo, g, listener, photo_retry=False, T0=T0)
+            await ask_polza(heard or "Глянь, что тут.", photo, g, listener, photo_retry=False, T0=T0, framing=2)
         return True
     if buf.strip() and V.gen == g:
         ui("Вася", buf.strip())
@@ -957,15 +1013,19 @@ async def ask_polza_audio(wav, g, ptt, need_name, listener, T0):
     return True
 
 
-async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None):
+async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None, framing=0, offered=False):
     T0 = T0 or time.time()
     first = True
+    prompt_text = text + (FRAMING_RULE if photo and framing > 1 else
+                          " Это уже поправленный кадр — реши по тому, что видно." if photo and framing == 1 else "")
+    if offered:
+        prompt_text += OFFER_NOTE
     if time.time() - V.last > config.NEW_SESSION_AFTER_S:
         V.phist = []
     V.last = time.time()
     mode = ("\n\nСЕЙЧАС ВКЛЮЧЁН ПРИЛИЧНЫЙ РЕЖИМ: никакого мата, общайся вежливо, но с юмором."
             if V.polite else "\n\nРЕЖИМ БЕЗ ЦЕНЗУРЫ: общайся в стиле, описанном выше.")
-    content = [{"type": "text", "text": text}]
+    content = [{"type": "text", "text": prompt_text}]
     if photo:
         content.append({"type": "image_url", "image_url": {
             "url": "data:image/jpeg;base64," + base64.b64encode(photo).decode(), "detail": "high"}})
@@ -986,7 +1046,7 @@ async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None):
                 if V.gen != g:
                     return
                 buf += piece
-                if "[ФОТО]" in buf:
+                if "[ФОТО]" in buf or "[РЕШАЮ]" in buf:
                     break
                 while True:
                     m = SENT_END.match(buf) or (FIRST_CLAUSE.match(buf) if first else None)
@@ -1014,19 +1074,34 @@ async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None):
             ui("Ошибка", human + "\n\n" + str(e)[:300])
             say(spoken)
             return
+    if offered:
+        OFFER["until"] = 0.0
+        if "[РЕШАЮ]" in buf:
+            return await solve_task(g, listener)
     if "[ФОТО]" in buf:
         if photo is None and photo_retry:
             p = await take_photo()
             if p is not None and V.gen == g:
-                return await ask_polza(text, p, g, listener, photo_retry=False)
+                return await ask_polza(text, p, g, listener, photo_retry=False, framing=2)
         buf = buf.replace("[ФОТО]", "")
     if buf.strip() and V.gen == g:
         ui("Вася", buf.strip())
         say(buf.strip(), g)
         answer.append(buf.strip())
+    full = " ".join(answer) + " " + buf
+    if "[ПЕРЕСНЯТЬ]" in full and photo is not None and framing > 1 and V.gen == g:
+        # Вася сказал, как поправить камеру — ждём, пока договорит и ты поправишь, и снимаем снова
+        status("Поправь камеру...")
+        await wait_quiet(2.5)
+        if V.gen != g:
+            return
+        p = await take_photo()
+        if p is not None and V.gen == g:
+            return await ask_polza(text, p, g, listener, framing=framing - 1)
+        return
     if answer and V.gen == g:
         V.phist += [{"role": "user", "content": text + (" [показал фото]" if photo else "")},
-                    {"role": "assistant", "content": " ".join(answer)}]
+                    {"role": "assistant", "content": MARKS.sub("", " ".join(answer))}]
         V.phist = V.phist[-config.HISTORY_TURNS * 2:]
         log(f"   Polza: потрачено с запуска ≈ {PZ.spent:.2f} ₽")
 
@@ -1043,10 +1118,23 @@ async def handle_bg(data_url):
         async for piece in PZ.chat_stream(CHAT["bg"], msgs, max_tokens=60):
             out += piece
         out = out.strip().strip("«»\"")
-        if out and out not in ("-", "—"):
-            SEEN.append((time.time(), out))
-            del SEEN[:-40]
-            log("   👁", out)
+        if not out or out in ("-", "—"):
+            return
+        m = re.match(r"^\W*задание\W*(да|нет)\W*\|?\s*(.*)$", out, re.I | re.S)
+        task = bool(m and m.group(1).lower() == "да")
+        desc = (m.group(2).strip() if m else out) or out
+        SEEN.append((time.time(), desc + (" [задание]" if task else "")))
+        del SEEN[:-40]
+        log("   👁", ("[задание] " if task else "") + desc)
+        now = time.time()
+        if task and now > OFFER["next"] and not is_speaking() and now - V.last > 8 and V.ws is not None:
+            OFFER["until"] = now + 15
+            OFFER["next"] = now + 240                 # не доставать предложениями чаще, чем раз в 4 минуты
+            if V.listener is not None:
+                V.listener.awake_until = now + 15     # ответ «да/нет» — без имени
+            line = random.choice(OFFER_LINES)
+            ui("Вася", line)
+            say(line)
     except Exception as e:
         log("Фон: не вышло:", type(e).__name__, str(e)[:150])
     finally:
@@ -1095,6 +1183,7 @@ async def ws_handler(request):
                 if t == "hello":
                     log("   привет от телефона:", m)
                     listener = Listener(m.get("rate", 48000))
+                    V.listener = listener
                     log(f"Микрофон телефона: {listener.rate} Гц")
                     status("Слушаю. Скажи «Вась» или держи кнопку")
                     await ws.send_str(json.dumps({"type": "cfg", "bg_interval": config.BG_INTERVAL_S,
