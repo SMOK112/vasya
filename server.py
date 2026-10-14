@@ -111,7 +111,7 @@ V = State()
 
 def gen_config():
     mode = ("\n\nСЕЙЧАС ВКЛЮЧЁН ПРИЛИЧНЫЙ РЕЖИМ: никакого мата, общайся вежливо, но с юмором."
-            if V.polite else "\n\nСЕЙЧАС МОЖНО И НУЖНО МАТЕРИТЬСЯ — сочно, в каждом ответе.")
+            if V.polite else "\n\nРЕЖИМ БЕЗ ЦЕНЗУРЫ: матерись жёстко и много, в каждом предложении, как в стиле выше.")
     tools = [types.Tool(google_search=types.GoogleSearch())] if V.search else None
     return types.GenerateContentConfig(system_instruction=PERSONA + mode + FORMAT,
                                        temperature=1.0, safety_settings=SAFETY, tools=tools)
@@ -127,7 +127,10 @@ def explain_error(e):
         return ("Google считает, что сервер в неподдерживаемой стране. Выполни на сервере: bash /opt/vasya/warp.sh",
                 "Гугл не пускает с этого сервера, глянь экран.")
     if "429" in low or "resource_exhausted" in low or "quota" in low:
-        return ("Кончился бесплатный лимит запросов, подожди минуту.", "Бля, лимит кончился. Подожди минутку.")
+        if "perday" in low or "per_day" in low or "daily" in low:
+            return ("У всех моделей кончился дневной бесплатный лимит Gemini. Сбросится через сутки "
+                    "(в полдень по Москве примерно).", "Всё, братан, на сегодня бесплатный мозг кончился, нахуй.")
+        return ("Слишком часто — бесплатный лимит в минуту. Подожди минуту.", "Бля, не гони, дай минуту отдышаться.")
     if "503" in low or "unavailable" in low or "overloaded" in low or "500" in low:
         return ("Gemini перегружен, попробуй ещё раз через пару секунд.", "Гугл тупит, повтори через секунду.")
     return ("Ошибка Gemini — скинь этот текст в чат.", "Хуйня какая-то с мозгом, глянь экран.")
@@ -786,22 +789,9 @@ async def ws_handler(request):
 async def on_startup(app):
     app["tts"] = asyncio.get_running_loop().create_task(tts_worker())
     log("Проверяю Gemini...")
+    # проверяем только список моделей — он бесплатный и не тратит дневной лимит запросов
     await discover_models()
-    try:
-        for model in list(MODELS):
-            try:
-                r = await client.aio.models.generate_content(model=model, contents="Ответь одним словом: ок")
-                log(f"Gemini на связи ({model}):", (r.text or "").strip()[:30])
-                return
-            except Exception as e:
-                if skip_model(model, e) and "location" not in str(e).lower():
-                    log(f"   {model}: не годится сейчас ({str(e)[:60]}), беру следующую")
-                    continue
-                raise
-        log("!!! Ни одна модель не ответила — скорее всего, кончились бесплатные лимиты. Подожди.")
-    except Exception as e:
-        log("!!! Gemini не отвечает:", type(e).__name__, str(e)[:300])
-        log("!!!", explain_error(e)[0])
+    log("Gemini доступен, моделей в очереди:", len(MODELS))
 
 
 def main():
