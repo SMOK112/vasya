@@ -69,14 +69,25 @@ class Polza:
         d = json.loads(txt)
         return (d.get("text") or "").strip(), self._cost(d.get("usage"))
 
-    async def chat_stream(self, model, messages, max_tokens=400, web_search=False):
-        """Отдаёт текст ответа кусочками по мере генерации."""
+    no_reasoning_ok = {}      # модель -> принимает ли «без рассуждений»
+
+    async def chat_stream(self, model, messages, max_tokens=1000, web_search=False):
+        """Отдаёт текст ответа кусочками по мере генерации. Рассуждения выключаем — так в разы быстрее."""
         s = await self.session()
         body = {"model": model, "messages": messages, "stream": True,
                 "max_tokens": max_tokens, "temperature": 1.0}
+        if self.no_reasoning_ok.get(model, True):
+            body["reasoning"] = {"enabled": False}
         if web_search:
             body["web_search_options"] = {}
-        async with s.post(URL + "/chat/completions", json=body) as r:
+        r = await s.post(URL + "/chat/completions", json=body)
+        if r.status == 400 and "reasoning" in body:
+            txt = await r.text()
+            r.release()
+            self.no_reasoning_ok[model] = False          # модель не умеет без рассуждений — шлём без параметра
+            body.pop("reasoning")
+            r = await s.post(URL + "/chat/completions", json=body)
+        async with r:
             if r.status != 200:
                 raise PolzaError(r.status, await r.text())
             async for raw in r.content:

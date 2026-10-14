@@ -266,7 +266,9 @@ async def tts_worker():
                 continue
             mp3 = None
             try:
+                t = time.time()
                 mp3 = await asyncio.wait_for(synth(text), 15)
+                log(f"   ⏱ озвучка {time.time() - t:.1f} с")
             except Exception as e:
                 log("Озвучка на сервере не вышла, пусть говорит телефон:", type(e).__name__, e)
             if gen != V.gen:
@@ -579,17 +581,21 @@ async def handle_phrase(audio, ptt=False, wake_hit=False, need_name=False, liste
     stop_talking()                       # новый вопрос — старый ответ больше не нужен
     g = V.gen
     status("Думаю...")
-    rough = await asyncio.get_running_loop().run_in_executor(None, rough_text, audio)
-    if rough:
-        log("   (Vosk расслышал:", rough + ")")
     dur = len(audio) / SR
+    T0 = time.time()
+    # грубая расшифровка Vosk нужна Gemini-режиму; в режиме Polza — только чтобы не платить за одно «Вась»
+    rough = ""
+    if BRAIN != "polza" or (wake_hit and not ptt and dur < 1.6):
+        rough = await asyncio.get_running_loop().run_in_executor(None, rough_text, audio)
+        if rough:
+            log("   (Vosk расслышал:", rough + ")")
     if wake_hit and not ptt and (only_names(rough) or (not rough and dur < 1.0)):
         if listener is not None:          # сказал только «Вась» — ждём вопрос
             listener.awake_until = time.time() + config.AWAKE_S
         status("Слушаю! Говори")
         return
     if BRAIN == "polza":
-        return await phrase_polza(audio, g, ptt, need_name, listener)
+        return await phrase_polza(audio, g, ptt, need_name, listener, T0)
     photo = await take_photo() if LOOK.search(rough) else None
     if V.gen != g:
         return
@@ -759,12 +765,14 @@ async def pick_polza_models():
     log("Polza: модели по очереди:", ", ".join(f"{m} ({have.get(m, (0, 0))[1]:g} ₽/1М)" for m in CHAT["models"]))
 
 
-async def phrase_polza(audio, g, ptt, need_name, listener):
+async def phrase_polza(audio, g, ptt, need_name, listener, T0=None):
+    T0 = T0 or time.time()
     wav = to_wav(audio)
     text, err, ok = "", None, False
     for model in config.STT_MODELS:
         try:
             text, cost = await PZ.transcribe(wav, model, prompt="Разговор с Васей.")
+            log(f"   ⏱ распознал за {time.time() - T0:.1f} с ({model})")
             ok = True
             break
         except Exception as e:
@@ -798,10 +806,12 @@ async def phrase_polza(audio, g, ptt, need_name, listener):
     photo = await take_photo() if LOOK.search(text.lower()) else None
     if V.gen != g:
         return
-    await ask_polza(text, photo, g, listener)
+    await ask_polza(text, photo, g, listener, T0=T0)
 
 
-async def ask_polza(text, photo, g, listener, photo_retry=True):
+async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None):
+    T0 = T0 or time.time()
+    first = True
     if time.time() - V.last > config.NEW_SESSION_AFTER_S:
         V.phist = []
     V.last = time.time()
@@ -831,6 +841,9 @@ async def ask_polza(text, photo, g, listener, photo_retry=True):
                         break
                     sentence, buf = m.group(1).strip(), buf[m.end():]
                     if sentence:
+                        if first:
+                            log(f"   ⏱ первая фраза ответа через {time.time() - T0:.1f} с ({models[i]})")
+                            first = False
                         ui("Вася", sentence)
                         say(sentence, g)
                         answer.append(sentence)
