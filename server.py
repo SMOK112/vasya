@@ -191,7 +191,8 @@ def clean_for_tts(text):
 
 
 async def synth(text) -> bytes:
-    comm = edge_tts.Communicate(text, config.VOICE, rate=config.TTS_RATE, pitch=config.TTS_PITCH)
+    comm = edge_tts.Communicate(text, config.VOICE, rate=config.TTS_RATE, pitch=config.TTS_PITCH,
+                                volume=getattr(config, "TTS_VOLUME", "+0%"))
     buf = bytearray()
     async for ch in comm.stream():
         if ch.get("type") == "audio":

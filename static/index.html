@@ -45,7 +45,7 @@
 </header>
 <div id="log"></div>
 <video id="cam" playsinline muted></video>
-<div class="vol">Громкость <input id="vol" type="range" min="0" max="100" value="35"></div>
+<div class="vol">Громкость <input id="vol" type="range" min="0" max="100" value="20"></div>
 <div class="row">
   <button id="camBtn" disabled>Камера</button>
   <button id="look" disabled>Глянь</button>
@@ -104,7 +104,7 @@ async function start() {
   }
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: {
-      channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+      channelCount: 1, echoCancellation: false, noiseSuppression: true, autoGainControl: true } });  // без эхоподавления телефон не врубает «громкую связь»
   } catch (e) {
     status('Нет доступа к микрофону: ' + e.message + '. Разреши в настройках сайта (замок слева от адреса).');
     $('go').disabled = false; return;
@@ -202,7 +202,7 @@ function idle() {
 function speakLocal(text) {
   if (!('speechSynthesis' in window)) return;
   const u = new SpeechSynthesisUtterance(text);
-  u.lang = 'ru-RU'; u.pitch = 1.5; u.rate = 1.15; u.volume = Math.min(1, +$('vol').value / 100 * 2);
+  u.lang = 'ru-RU'; u.pitch = 1.5; u.rate = 1.15; u.volume = Math.pow(+$('vol').value / 100, 2);
   speechQ++; dot('talk');
   u.onend = u.onerror = () => { if (--speechQ <= 0) { speechQ = 0; idle(); } };
   speechSynthesis.speak(u);
@@ -283,7 +283,7 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && ctx) { keepAwake(); if (ctx.state === 'suspended') ctx.resume(); }
 });
 $('go').onclick = start;
-$('vol').value = store('vasya_vol') || 35;
+$('vol').value = store('vasya_vol') || 20;
 $('vol').oninput = setVol;
 $('camBtn').onclick = async () => {
   camOn = !camOn;
