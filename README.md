@@ -22,6 +22,12 @@ git clone https://github.com/SMOK112/vasya.git /opt/vasya && bash /opt/vasya/dep
 Скрипт спросит ключ Gemini (https://aistudio.google.com/apikey), всё поставит, включит автозапуск
 и HTTPS на адресе `IP-сервера.sslip.io`, а в конце напечатает ссылку для телефона с ключом доступа.
 
+Если в логах «User location is not supported» — Google не любит IP сервера. Тогда:
+
+```bash
+bash /opt/vasya/warp.sh       # запросы к Gemini пойдут через Cloudflare WARP, остальной сервер не трогается
+```
+
 ## Как пользоваться
 
 - Скажи «Вась» — «дзынь» — говори вопрос. Или одной фразой: «Вась, глянь что тут написано».

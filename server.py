@@ -37,7 +37,7 @@ def log(*a):
 
 def load_env():
     p = os.path.join(BASE, ".env")
-    if os.path.isfile(p):
+    if os.path.isfile(p) and os.access(p, os.R_OK):
         with open(p, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -61,7 +61,14 @@ if not TOKEN:
 from google import genai
 from google.genai import types
 
-client = genai.Client(api_key=API_KEY)
+PROXY = os.environ.get("GEMINI_PROXY", "")   # напр. socks5://127.0.0.1:40000 (Cloudflare WARP, см. warp.sh)
+if PROXY:
+    import httpx
+    client = genai.Client(api_key=API_KEY, http_options=types.HttpOptions(
+        httpx_async_client=httpx.AsyncClient(proxy=PROXY, timeout=httpx.Timeout(60.0, connect=15.0))))
+    log("Gemini — через прокси", PROXY)
+else:
+    client = genai.Client(api_key=API_KEY)
 
 with open(os.path.join(BASE, "persona.txt"), encoding="utf-8") as f:
     PERSONA = f.read()
@@ -117,7 +124,8 @@ def explain_error(e):
         return ("Ключ Gemini не подошёл. Создай новый в AI Studio и поменяй GEMINI_API_KEY в /opt/vasya/.env, "
                 "потом: systemctl restart vasya", "Ключ от мозга не подходит, глянь экран.")
     if "location" in low:
-        return ("Google не пускает из страны сервера.", "Гугл не пускает с этого сервера, глянь экран.")
+        return ("Google считает, что сервер в неподдерживаемой стране. Выполни на сервере: bash /opt/vasya/warp.sh",
+                "Гугл не пускает с этого сервера, глянь экран.")
     if "429" in low or "resource_exhausted" in low or "quota" in low:
         return ("Кончился бесплатный лимит запросов, подожди минуту.", "Бля, лимит кончился. Подожди минутку.")
     if "503" in low or "unavailable" in low or "overloaded" in low or "500" in low:

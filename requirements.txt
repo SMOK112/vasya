@@ -1,5 +1,6 @@
 numpy
 aiohttp
+httpx[socks]
 google-genai
 edge-tts
 onnxruntime
