@@ -1,0 +1,6 @@
+numpy
+aiohttp
+google-genai
+edge-tts
+onnxruntime
+vosk
