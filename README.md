@@ -28,6 +28,12 @@ git clone https://github.com/SMOK112/vasya.git /opt/vasya && bash /opt/vasya/dep
 bash /opt/vasya/warp.sh       # запросы к Gemini пойдут через Cloudflare WARP, остальной сервер не трогается
 ```
 
+Мозг через Polza.ai (рубли, без лимитов бесплатного Gemini, ВПН не нужен):
+
+```bash
+bash /opt/vasya/polza.sh      # спросит API-ключ Polza, проверит и включит
+```
+
 ## Как пользоваться
 
 - Ссылку и QR-код для телефона показать ещё раз: `bash /opt/vasya/link.sh`

@@ -52,8 +52,10 @@ TOKEN = os.environ.get("VASYA_TOKEN", "")
 PORT = int(os.environ.get("VASYA_PORT", "8080"))
 HOST = os.environ.get("VASYA_HOST", "127.0.0.1")
 
-if not API_KEY:
-    raise SystemExit("Нет GEMINI_API_KEY в .env — запусти deploy.sh или впиши ключ руками.")
+POLZA_KEY = os.environ.get("POLZA_API_KEY", "")
+BRAIN = "polza" if POLZA_KEY else "gemini"     # есть ключ Polza — думаем через Polza.ai, иначе через Gemini
+if not API_KEY and not POLZA_KEY:
+    raise SystemExit("Нет ни POLZA_API_KEY, ни GEMINI_API_KEY в .env — запусти polza.sh или deploy.sh.")
 if not TOKEN:
     log("!!! VASYA_TOKEN пустой — страница открыта всем, кто знает адрес. Так лучше не делать.")
 
@@ -62,7 +64,9 @@ from google import genai
 from google.genai import types
 
 PROXY = os.environ.get("GEMINI_PROXY", "")   # напр. socks5://127.0.0.1:40000 (Cloudflare WARP, см. warp.sh)
-if PROXY:
+if not API_KEY:
+    client = None
+elif PROXY:
     import httpx
     client = genai.Client(api_key=API_KEY, http_options=types.HttpOptions(
         httpx_async_client=httpx.AsyncClient(proxy=PROXY, timeout=httpx.Timeout(60.0, connect=15.0))))
@@ -104,6 +108,7 @@ class State:
         self.snap_id = 0
         self.snap_fut = None
         self.greeted = 0.0
+        self.phist = []              # история для Polza (текстом)
 
 
 V = State()
@@ -559,6 +564,7 @@ def handle_command(t) -> bool:
         return True
     if "новый разговор" in low or "забудь всё" in low or "забудь все" in low:
         V.history = []
+        V.phist = []
         say("Всё, чистый лист.")
         return True
     return False
@@ -582,6 +588,8 @@ async def handle_phrase(audio, ptt=False, wake_hit=False, need_name=False, liste
             listener.awake_until = time.time() + config.AWAKE_S
         status("Слушаю! Говори")
         return
+    if BRAIN == "polza":
+        return await phrase_polza(audio, g, ptt, need_name, listener)
     photo = await take_photo() if LOOK.search(rough) else None
     if V.gen != g:
         return
@@ -597,6 +605,8 @@ async def handle_look(photo):
     stop_talking()
     g = V.gen
     ui("Ты", "[фото] Глянь, чё тут")
+    if BRAIN == "polza":
+        return await ask_polza("Глянь, чё тут. Если это задание — реши и скажи ответ.", photo, g, None)
     await ask([], "Хозяин показывает тебе камеру: глянь, чё тут. Если это задание — реши и скажи ответ.",
               photo, g, None, heard_known="[фото] Глянь, чё тут")
 
@@ -712,6 +722,148 @@ async def ask(parts, note, photo, g, listener, heard_known=None, photo_retry=Tru
         V.history = V.history[-config.HISTORY_TURNS * 2:]
 
 
+
+# ====================================================================== мозг через Polza.ai
+from polza import Polza, PolzaError, human_error as polza_human, retryable as polza_retryable
+
+PZ = Polza(POLZA_KEY) if POLZA_KEY else None
+CHAT = {"models": list(config.CHAT_MODELS)}
+POLZA_FORMAT = """
+
+КАК ТЕБЕ ПРИХОДЯТ СООБЩЕНИЯ:
+Тебе приходит расшифровка речи хозяина (распознавалка может ошибаться в словах — догадывайся по смыслу),
+иногда вместе с фото с камеры — это то, что он сейчас видит. Отвечай сразу по делу, не пересказывай вопрос.
+Если чтобы ответить, нужно посмотреть камерой (просит глянуть, прочитать, решить то, что перед ним), а фото нет —
+ответь только «[ФОТО]» и больше ничего.
+"""
+HALLUCINATION = re.compile(r"^\W*(большое спасибо|спасибо( за (внимание|просмотр))?|продолжение следует|"
+                           r"субтитры.*|редактор субтитров.*|подписывайтесь.*|всем пока|до свидания)\W*$", re.I)
+NAME_PREFIX = re.compile(r"^\W*(в[ао]с[яьеюи]\w*|васян\w*|васек|васёк)[\s,!.?—-]*", re.I)
+
+
+async def pick_polza_models():
+    """Берём модели из config.CHAT_MODELS, которые реально есть и понимают картинки; иначе — самую дешёвую с картинками."""
+    try:
+        allm = await PZ.models()
+    except Exception as e:
+        log("   Список моделей Polza не получил:", type(e).__name__, str(e)[:150])
+        return
+    have = {mid: (img, price) for mid, img, price in allm}
+    chosen = [m for m in config.CHAT_MODELS if m in have and have[m][0]]
+    if not chosen:
+        cands = sorted([(price, mid) for mid, img, price in allm if img and ("flash" in mid or "mini" in mid)])
+        cands = cands or sorted([(price, mid) for mid, img, price in allm if img])
+        chosen = [mid for _, mid in cands[:3]]
+    if chosen:
+        CHAT["models"] = chosen
+    log("Polza: модели по очереди:", ", ".join(f"{m} ({have.get(m, (0, 0))[1]:g} ₽/1М)" for m in CHAT["models"]))
+
+
+async def phrase_polza(audio, g, ptt, need_name, listener):
+    wav = to_wav(audio)
+    text, err, ok = "", None, False
+    for model in config.STT_MODELS:
+        try:
+            text, cost = await PZ.transcribe(wav, model, prompt="Разговор с Васей.")
+            ok = True
+            break
+        except Exception as e:
+            err = e
+            log(f"Распознавание ({model}) не вышло:", type(e).__name__, str(e)[:200])
+            if getattr(e, "status", 0) in (401, 402, 403):
+                break
+    if not ok:
+        human, spoken = polza_human(err)
+        ui("Ошибка", human + "\n\n" + str(err)[:300])
+        say(spoken)
+        return
+    if V.gen != g:
+        return
+    if not text or HALLUCINATION.match(text) or text.strip(" .") == "Разговор с Васей":
+        status("Слушаю")
+        return
+    q = NAME_PREFIX.sub("", text).strip()
+    if need_name and q == text.strip():
+        log("   (не мне, молчу):", text)
+        status("Слушаю")
+        return
+    ui("Ты", text)
+    if handle_command(text):
+        return
+    if not q.strip(" .,!?") and not ptt:            # сказал только имя — ждём вопрос
+        if listener is not None:
+            listener.awake_until = time.time() + config.AWAKE_S
+        status("Слушаю! Говори")
+        return
+    photo = await take_photo() if LOOK.search(text.lower()) else None
+    if V.gen != g:
+        return
+    await ask_polza(text, photo, g, listener)
+
+
+async def ask_polza(text, photo, g, listener, photo_retry=True):
+    if time.time() - V.last > config.NEW_SESSION_AFTER_S:
+        V.phist = []
+    V.last = time.time()
+    mode = ("\n\nСЕЙЧАС ВКЛЮЧЁН ПРИЛИЧНЫЙ РЕЖИМ: никакого мата, общайся вежливо, но с юмором."
+            if V.polite else "\n\nРЕЖИМ БЕЗ ЦЕНЗУРЫ: общайся в стиле, описанном выше.")
+    content = [{"type": "text", "text": text}]
+    if photo:
+        content.append({"type": "image_url", "image_url": {
+            "url": "data:image/jpeg;base64," + base64.b64encode(photo).decode(), "detail": "high"}})
+    messages = [{"role": "system", "content": PERSONA + mode + POLZA_FORMAT}] + V.phist + \
+               [{"role": "user", "content": content}]
+    status("Думаю...")
+    models = list(CHAT["models"])
+    answer, said, i = [], False, 0
+    while i < len(models):
+        buf = ""
+        try:
+            async for piece in PZ.chat_stream(models[i], messages, web_search=config.POLZA_WEB_SEARCH):
+                if V.gen != g:
+                    return
+                buf += piece
+                if "[ФОТО]" in buf:
+                    break
+                while True:
+                    m = SENT_END.match(buf)
+                    if not m:
+                        break
+                    sentence, buf = m.group(1).strip(), buf[m.end():]
+                    if sentence:
+                        ui("Вася", sentence)
+                        say(sentence, g)
+                        answer.append(sentence)
+                        said = True
+            break
+        except Exception as e:
+            log(f"Ошибка Polza ({models[i]}):", type(e).__name__, str(e)[:300])
+            if V.gen != g:
+                return
+            if not said and polza_retryable(e) and i + 1 < len(models):
+                i += 1
+                log("   Пробую модель", models[i])
+                continue
+            human, spoken = polza_human(e)
+            ui("Ошибка", human + "\n\n" + str(e)[:300])
+            say(spoken)
+            return
+    if "[ФОТО]" in buf:
+        if photo is None and photo_retry:
+            p = await take_photo()
+            if p is not None and V.gen == g:
+                return await ask_polza(text, p, g, listener, photo_retry=False)
+        buf = buf.replace("[ФОТО]", "")
+    if buf.strip() and V.gen == g:
+        ui("Вася", buf.strip())
+        say(buf.strip(), g)
+        answer.append(buf.strip())
+    if answer and V.gen == g:
+        V.phist += [{"role": "user", "content": text + (" [показал фото]" if photo else "")},
+                    {"role": "assistant", "content": " ".join(answer)}]
+        V.phist = V.phist[-config.HISTORY_TURNS * 2:]
+        log(f"   Polza: потрачено с запуска ≈ {PZ.spent:.2f} ₽")
+
 # ====================================================================== веб-сервер
 async def index(request):
     return web.FileResponse(os.path.join(BASE, "static", "index.html"),
@@ -789,6 +941,10 @@ async def ws_handler(request):
 async def on_startup(app):
     app["tts"] = asyncio.get_running_loop().create_task(tts_worker())
     log("Проверяю Gemini...")
+    if BRAIN == "polza":
+        log("Мозг: Polza.ai")
+        await pick_polza_models()
+        return
     # проверяем только список моделей — он бесплатный и не тратит дневной лимит запросов
     await discover_models()
     log("Gemini доступен, моделей в очереди:", len(MODELS))

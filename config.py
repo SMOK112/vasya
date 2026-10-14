@@ -28,3 +28,12 @@ PAUSE_MS = 700
 # Память разговора: сколько последних пар «вопрос-ответ» помнить и когда начинать заново (с)
 HISTORY_TURNS = 8
 NEW_SESSION_AFTER_S = 600
+
+# ====== Polza.ai (если в .env есть POLZA_API_KEY — Вася думает через неё, Gemini не нужен)
+# Распознавание речи — по очереди, если первая не ответила
+STT_MODELS = ["openai/gpt-4o-mini-transcribe", "openai/whisper-large-v3-turbo", "openai/whisper-1"]
+# Мозг — берутся те, что реально есть на Polza и понимают фото; если ни одной — самая дешёвая с фото
+CHAT_MODELS = ["google/gemini-3.8-flash", "google/gemini-3-flash", "google/gemini-2.5-flash",
+               "openai/gpt-5-mini", "openai/gpt-4.1-mini", "openai/gpt-4o-mini"]
+# Поиск в интернете через Polza (немного дороже за запрос)
+POLZA_WEB_SEARCH = False
