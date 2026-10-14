@@ -136,11 +136,55 @@ def explain_error(e):
 COOLDOWN = {}          # модель -> до какого времени не трогать (кончился лимит)
 
 
+MODELS = list(config.GEMINI_MODELS)   # дополняется при старте тем, что реально есть у ключа
+BAD_WORDS = ("tts", "image", "audio", "live", "embed", "robotics", "computer", "veo", "imagen", "learnlm", "gemma")
+
+
+async def discover_models():
+    """Спросить у Google, какие модели доступны ключу, и добавить подходящие «flash» в очередь."""
+    found = []
+    try:
+        async for m in await client.aio.models.list():
+            name = (m.name or "").split("/")[-1]
+            acts = m.supported_actions or []
+            if "generateContent" in acts and "flash" in name and not any(b in name for b in BAD_WORDS):
+                found.append(name)
+    except Exception as e:
+        log("   Список моделей не получил:", type(e).__name__, str(e)[:120])
+        return
+
+    def ver(n):
+        m = re.search(r"(\d+(?:\.\d+)?)", n)
+        return float(m.group(1)) if m else 0.0
+
+    # свежие версии вперёд, «lite» после полной, превью — в конце
+    found.sort(key=lambda n: ("preview" in n or "exp" in n, "lite" in n, -ver(n), n))
+    for n in found:
+        if n not in MODELS:
+            MODELS.append(n)
+    log("   Модели по очереди:", ", ".join(MODELS))
+
+
 def models_now():
-    """Модели по порядку, но те, у которых кончился лимит, — в конец."""
+    """Модели по порядку, но те, у которых кончился лимит или которых нет, — в конец."""
     now = time.time()
-    ok = [m for m in config.GEMINI_MODELS if COOLDOWN.get(m, 0) <= now]
-    return ok + [m for m in config.GEMINI_MODELS if m not in ok]
+    ok = [m for m in MODELS if COOLDOWN.get(m, 0) <= now]
+    return ok + [m for m in MODELS if m not in ok]
+
+
+def skip_model(model, e):
+    """Пометить модель как временно/насовсем бесполезную. True — можно пробовать следующую."""
+    low = str(e).lower()
+    if "429" in low or "resource_exhausted" in low or "quota" in low:
+        COOLDOWN[model] = time.time() + 30 * 60          # лимит кончился — полчаса не трогаем
+        return True
+    if "404" in low or "not_found" in low or "no longer available" in low:
+        COOLDOWN[model] = time.time() + 24 * 3600        # модели больше нет — сутки не трогаем
+        return True
+    if "400" in low and "invalid_argument" in low:
+        COOLDOWN[model] = time.time() + 3600             # модель не умеет то, что надо (звук/фото)
+        return True
+    return retryable(e)
 
 
 def retryable(e):
@@ -649,9 +693,7 @@ async def ask(parts, note, photo, g, listener, heard_known=None, photo_retry=Tru
                 log("   Выключаю поиск и пробую снова")
                 V.search = False
                 continue
-            if "429" in low or "resource_exhausted" in low or "quota" in low:
-                COOLDOWN[model] = time.time() + 30 * 60      # лимит кончился — полчаса не трогаем
-            if not said and retryable(e) and i + 1 < len(models):
+            if skip_model(model, e) and not said and i + 1 < len(models):
                 log("   Пробую модель", models[i + 1])
                 i += 1
                 continue
@@ -744,20 +786,19 @@ async def ws_handler(request):
 async def on_startup(app):
     app["tts"] = asyncio.get_running_loop().create_task(tts_worker())
     log("Проверяю Gemini...")
+    await discover_models()
     try:
-        for model in config.GEMINI_MODELS:
+        for model in list(MODELS):
             try:
                 r = await client.aio.models.generate_content(model=model, contents="Ответь одним словом: ок")
                 log(f"Gemini на связи ({model}):", (r.text or "").strip()[:30])
                 return
             except Exception as e:
-                low = str(e).lower()
-                if "429" in low or "quota" in low or "resource_exhausted" in low:
-                    COOLDOWN[model] = time.time() + 30 * 60
-                    log(f"   {model}: кончился бесплатный лимит, беру следующую")
+                if skip_model(model, e) and "location" not in str(e).lower():
+                    log(f"   {model}: не годится сейчас ({str(e)[:60]}), беру следующую")
                     continue
                 raise
-        log("!!! У всех моделей кончился бесплатный лимит — подожди или поменяй GEMINI_MODELS в config.py")
+        log("!!! Ни одна модель не ответила — скорее всего, кончились бесплатные лимиты. Подожди.")
     except Exception as e:
         log("!!! Gemini не отвечает:", type(e).__name__, str(e)[:300])
         log("!!!", explain_error(e)[0])

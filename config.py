@@ -3,7 +3,8 @@
 
 # Модели Gemini по очереди: если первая перегружена (503) или кончился дневной лимит (429) — берём следующую.
 # У бесплатного ключа у каждой модели свой дневной лимит, так что запасных побольше
-GEMINI_MODELS = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+GEMINI_MODELS = ["gemini-flash-latest", "gemini-flash-lite-latest"]
+# (при запуске Вася сам спрашивает у Google, какие ещё flash-модели доступны, и добавляет их в запас)
 
 # Может ли Вася гуглить (свежие мемы, новости). Если ключ не тянет — сам выключится
 WEB_SEARCH = True
