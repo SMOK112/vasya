@@ -256,21 +256,29 @@ def is_speaking():
     return V.tts_busy or not V.q.empty() or time.time() < V.play_until
 
 
+async def synth_safe(text):
+    """Озвучить фразу; None — если сервер Microsoft не ответил (тогда скажет сам телефон)."""
+    try:
+        t = time.time()
+        mp3 = await asyncio.wait_for(synth(text), 15)
+        log(f"   ⏱ озвучка {time.time() - t:.1f} с")
+        return mp3
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log("Озвучка на сервере не вышла, пусть говорит телефон:", type(e).__name__, e)
+        return None
+
+
 async def tts_worker():
+    """Фразы озвучиваются сразу, параллельно (say запускает синтез), а отправляются строго по порядку."""
     while True:
-        gen, text = await V.q.get()
+        gen, text, task = await V.q.get()
         V.tts_busy = True
         try:
-            text = clean_for_tts(text)
-            if gen != V.gen or not re.search(r"[а-яА-Яa-zA-Z0-9]", text):
+            if gen != V.gen or task is None:
                 continue
-            mp3 = None
-            try:
-                t = time.time()
-                mp3 = await asyncio.wait_for(synth(text), 15)
-                log(f"   ⏱ озвучка {time.time() - t:.1f} с")
-            except Exception as e:
-                log("Озвучка на сервере не вышла, пусть говорит телефон:", type(e).__name__, e)
+            mp3 = await task
             if gen != V.gen:
                 continue
             now = time.time()
@@ -279,18 +287,26 @@ async def tts_worker():
                     V.play_until = max(now, V.play_until) + len(mp3) * 8 / 48000 + 0.4
             elif await send({"type": "speak", "text": text}):
                 V.play_until = max(now, V.play_until) + len(text) / 13 + 0.6
+        except asyncio.CancelledError:
+            pass
         finally:
             V.tts_busy = False
 
 
 def say(text, gen=None):
-    V.q.put_nowait((V.gen if gen is None else gen, text))
+    text = clean_for_tts(text)
+    task = None
+    if re.search(r"[а-яА-Яa-zA-Z0-9]", text):
+        task = asyncio.get_running_loop().create_task(synth_safe(text))   # синтез стартует сразу
+    V.q.put_nowait((V.gen if gen is None else gen, text, task))
 
 
 def stop_talking(tell_phone=True):
     V.gen += 1
     while not V.q.empty():
-        V.q.get_nowait()
+        _, _, task = V.q.get_nowait()
+        if task is not None:
+            task.cancel()
     V.play_until = 0.0
     if tell_phone:
         fire({"type": "stop"})
@@ -733,7 +749,12 @@ async def ask(parts, note, photo, g, listener, heard_known=None, photo_retry=Tru
 from polza import Polza, PolzaError, human_error as polza_human, retryable as polza_retryable
 
 PZ = Polza(POLZA_KEY) if POLZA_KEY else None
-CHAT = {"models": list(config.CHAT_MODELS)}
+CHAT = {"models": list(config.CHAT_MODELS), "bg": config.BG_MODEL}
+SEEN = []                     # (время, что видно) — заметки фонового режима
+BG = {"busy": False}
+BG_PROMPT = ("Ты — глаза голосового помощника. По кадру с камеры очков напиши одну короткую строку, до пятнадцати слов: "
+             "где хозяин, что перед ним, есть ли рядом люди и чем они заняты, есть ли текст или задание. "
+             "Без догадок о том, кто эти люди. Если кадр тёмный или смазанный — напиши только «-».")
 POLZA_FORMAT = """
 
 КАК ТЕБЕ ПРИХОДЯТ СООБЩЕНИЯ:
@@ -762,6 +783,12 @@ async def pick_polza_models():
         chosen = [mid for _, mid in cands[:3]]
     if chosen:
         CHAT["models"] = chosen
+    if not CHAT["bg"] or CHAT["bg"] not in have:
+        cheap = sorted([(price, mid) for mid, img, price in allm
+                        if img and any(k in mid for k in ("flash", "mini", "lite", "nano"))])
+        cheap = cheap or sorted([(price, mid) for mid, img, price in allm if img])
+        CHAT["bg"] = cheap[0][1] if cheap else CHAT["models"][0]
+    log(f"Polza: фон смотрит {CHAT['bg']} ({have.get(CHAT['bg'], (0, 0))[1]:g} ₽/1М)")
     log("Polza: модели по очереди:", ", ".join(f"{m} ({have.get(m, (0, 0))[1]:g} ₽/1М)" for m in CHAT["models"]))
 
 
@@ -821,6 +848,10 @@ async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None):
     if photo:
         content.append({"type": "image_url", "image_url": {
             "url": "data:image/jpeg;base64," + base64.b64encode(photo).decode(), "detail": "high"}})
+    seen = [(t, x) for t, x in SEEN if time.time() - t < config.BG_MEMORY_MIN * 60][-6:]
+    if seen:
+        mode += "\n\nЧТО ТЫ НЕДАВНО ВИДЕЛ КАМЕРОЙ (используй, только если к месту):\n" + \
+                "\n".join(time.strftime("[%H:%M] ", time.localtime(t)) + x for t, x in seen)
     messages = [{"role": "system", "content": PERSONA + mode + POLZA_FORMAT}] + V.phist + \
                [{"role": "user", "content": content}]
     status("Думаю...")
@@ -829,7 +860,8 @@ async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None):
     while i < len(models):
         buf = ""
         try:
-            async for piece in PZ.chat_stream(models[i], messages, web_search=config.POLZA_WEB_SEARCH):
+            async for piece in PZ.chat_stream(models[i], messages, max_tokens=config.ANSWER_MAX_TOKENS,
+                                              web_search=config.POLZA_WEB_SEARCH):
                 if V.gen != g:
                     return
                 buf += piece
@@ -877,6 +909,29 @@ async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None):
         V.phist = V.phist[-config.HISTORY_TURNS * 2:]
         log(f"   Polza: потрачено с запуска ≈ {PZ.spent:.2f} ₽")
 
+async def handle_bg(data_url):
+    """Фоновый кадр: одна строчка «что вокруг» в память. Сам Вася при этом молчит."""
+    if PZ is None or BG["busy"] or not data_url:
+        return
+    BG["busy"] = True
+    try:
+        msgs = [{"role": "system", "content": BG_PROMPT},
+                {"role": "user", "content": [{"type": "text", "text": "Кадр с камеры очков."},
+                                             {"type": "image_url", "image_url": {"url": data_url, "detail": "low"}}]}]
+        out = ""
+        async for piece in PZ.chat_stream(CHAT["bg"], msgs, max_tokens=60):
+            out += piece
+        out = out.strip().strip("«»\"")
+        if out and out not in ("-", "—"):
+            SEEN.append((time.time(), out))
+            del SEEN[:-40]
+            log("   👁", out)
+    except Exception as e:
+        log("Фон: не вышло:", type(e).__name__, str(e)[:150])
+    finally:
+        BG["busy"] = False
+
+
 # ====================================================================== веб-сервер
 async def index(request):
     return web.FileResponse(os.path.join(BASE, "static", "index.html"),
@@ -921,6 +976,8 @@ async def ws_handler(request):
                     listener = Listener(m.get("rate", 48000))
                     log(f"Микрофон телефона: {listener.rate} Гц")
                     status("Слушаю. Скажи «Вась» или держи кнопку")
+                    await ws.send_str(json.dumps({"type": "cfg", "bg_interval": config.BG_INTERVAL_S,
+                                                  "bg_ok": BRAIN == "polza"}))
                     if time.time() - V.greeted > 120:
                         V.greeted = time.time()
                         say("Здорово! Вася на связи." if V.polite else "Здорово, братан! Вася на связи, хули.")
@@ -932,6 +989,9 @@ async def ws_handler(request):
                 elif t == "idle":
                     if not V.tts_busy and V.q.empty():
                         V.play_until = min(V.play_until, time.time() + 0.2)
+                elif t == "bg":
+                    if BRAIN == "polza" and not is_speaking():
+                        spawn(handle_bg(m.get("data")))
                 elif t == "photo":
                     data = m.get("data")
                     data = base64.b64decode(data.split(",", 1)[-1]) if data else None

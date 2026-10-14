@@ -35,7 +35,8 @@
   #talk.down { background:#ff4d4d; transform:scale(.97); }
   .msg img { display:block; max-width:100%; border-radius:10px; margin-top:4px; }
   #camBtn.on { background:var(--acc); color:#111; }
-  #look, #camBtn { background:var(--card); color:var(--text); }
+  #look, #camBtn, #bg { background:var(--card); color:var(--text); }
+  #bg.on { background:#2ecc71; color:#111; }
 </style>
 </head>
 <body>
@@ -49,6 +50,7 @@
 <div class="row">
   <button id="camBtn" disabled>Камера</button>
   <button id="look" disabled>Глянь</button>
+  <button id="bg" disabled>Фон</button>
 </div>
 <div class="row">
   <button id="go">Погнали</button>
@@ -61,7 +63,7 @@
 const $ = id => document.getElementById(id);
 let chain = Promise.resolve(), speechQ = 0;
 let ctx, ws, stream, out, nextT = 0, sources = [], wake = null, mutedUntil = 0;
-let cam = null, camOn = false;
+let cam = null, camOn = false, bgOn = false, bgTimer = null, lastThumb = null, BG_INT = 30;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; } }
 // ключ доступа приходит в ссылке (?k=...) один раз, дальше помним его на телефоне
@@ -155,6 +157,8 @@ async function connect() {
     else if (m.type === 'snap') sendPhoto(m.id, false);
     else if (m.type === 'wake') wakeBeep();
     else if (m.type === 'speak') speakLocal(m.text);
+    else if (m.type === 'cfg') { BG_INT = m.bg_interval || 30; $('bg').disabled = !m.bg_ok;
+                                 if (m.bg_ok && !bgOn && store('vasya_bg') === '1') toggleBg(); }
   };
   ws.onclose = () => {
     dot('off');
@@ -244,7 +248,7 @@ async function sendPhoto(id, ask) {
     if (data.length < 5000) throw new Error('кадр пустой, попробуй ещё раз');
     addLog('Камера', ask ? 'Глянь, чё тут' : 'Сфоткал', data);
   } catch (e) { data = null; error = e.message; status('Камера: ' + e.message); }
-  if (!camOn) closeCam();
+  if (!camOn && !bgOn) closeCam();
   if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'photo', id, ask, data, error }));
 }
 
@@ -289,8 +293,43 @@ $('camBtn').onclick = async () => {
   camOn = !camOn;
   $('camBtn').classList.toggle('on', camOn); $('cam').classList.toggle('on', camOn);
   if (camOn) { try { await openCam(); } catch (e) { camOn = false; status('Камера не открылась: ' + e.message); } }
-  else closeCam();
+  else if (!bgOn) closeCam();
 };
+
+// ---- фон: раз в BG_INT секунд маленький кадр, но только если картинка заметно поменялась
+async function toggleBg() {
+  bgOn = !bgOn;
+  store('vasya_bg', bgOn ? '1' : '');
+  $('bg').classList.toggle('on', bgOn);
+  clearInterval(bgTimer); lastThumb = null;
+  if (bgOn) {
+    try { await openCam(); } catch (e) { bgOn = false; $('bg').classList.remove('on'); status('Камера: ' + e.message); return; }
+    bgTimer = setInterval(bgShot, BG_INT * 1000);
+    setTimeout(bgShot, 2500);
+  } else if (!camOn) closeCam();
+}
+function bgShot() {
+  if (!bgOn || !cam || !ws || ws.readyState !== 1) return;
+  const v = $('cam');
+  if (!v.videoWidth) return;
+  const t = document.createElement('canvas'); t.width = t.height = 16;
+  const tc = t.getContext('2d', { willReadFrequently: true });
+  tc.drawImage(v, 0, 0, 16, 16);
+  const d = tc.getImageData(0, 0, 16, 16).data, g = new Float32Array(256);
+  for (let i = 0; i < 256; i++) g[i] = (d[4 * i] + d[4 * i + 1] + d[4 * i + 2]) / 3;
+  if (lastThumb) {
+    let diff = 0;
+    for (let i = 0; i < 256; i++) diff += Math.abs(g[i] - lastThumb[i]);
+    if (diff / 256 < 12) return;                 // почти ничего не поменялось — не тратим деньги
+  }
+  lastThumb = g;
+  const k = Math.min(1, 640 / Math.max(v.videoWidth, v.videoHeight));
+  const c = document.createElement('canvas');
+  c.width = Math.round(v.videoWidth * k); c.height = Math.round(v.videoHeight * k);
+  c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+  ws.send(JSON.stringify({ type: 'bg', data: c.toDataURL('image/jpeg', 0.7) }));
+}
+$('bg').onclick = toggleBg;
 // ---- «Держи и говори»: пока держишь — всё сказанное идёт Васе, без имени
 function ptt(on) {
   if ($('talk').classList.contains('down') === on) return;
