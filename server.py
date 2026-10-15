@@ -251,8 +251,8 @@ def clean_for_tts(text):
     return re.sub(r"\s+", " ", text).strip()
 
 
-async def synth(text) -> bytes:
-    comm = edge_tts.Communicate(text, config.VOICE, rate=config.TTS_RATE, pitch=config.TTS_PITCH,
+async def synth(text, rate=None) -> bytes:
+    comm = edge_tts.Communicate(text, config.VOICE, rate=rate or config.TTS_RATE, pitch=config.TTS_PITCH,
                                 volume=getattr(config, "TTS_VOLUME", "+0%"))
     buf = bytearray()
     async for ch in comm.stream():
@@ -268,13 +268,13 @@ def is_speaking():
 TTS_SEM = asyncio.Semaphore(2)     # больше 2 разом Microsoft начинает отказывать — и вылезал «второй голос»
 
 
-async def synth_safe(text):
+async def synth_safe(text, rate=None):
     """Озвучить фразу; None — если сервер Microsoft не ответил даже со второй попытки."""
     for attempt in (1, 2):
         try:
             async with TTS_SEM:
                 t = time.time()
-                mp3 = await asyncio.wait_for(synth(text), 12)
+                mp3 = await asyncio.wait_for(synth(text, rate), 12)
             log(f"   ⏱ озвучка {time.time() - t:.1f} с")
             if mp3:
                 V.tts_fail = 0
@@ -317,18 +317,18 @@ async def tts_worker():
             V.tts_busy = False
 
 
-def say(text, gen=None, who=None):
+def say(text, gen=None, who=None, rate=None):
     shown = text
     text = clean_for_tts(text)
     task = None
     if re.search(r"[а-яА-Яa-zA-Z0-9]", text) and not V.mute:
-        task = asyncio.get_running_loop().create_task(synth_safe(text))   # синтез стартует сразу
+        task = asyncio.get_running_loop().create_task(synth_safe(text, rate))   # синтез стартует сразу
     V.q.put_nowait((V.gen if gen is None else gen, text, task, (who, shown)))
 
 
-def speak(who, text, gen=None):
+def speak(who, text, gen=None, rate=None):
     """Сказать и показать: текст появится на экране, когда начнётся голос (в «Без звука» — сразу)."""
-    say(text, gen, who=who)
+    say(text, gen, who=who, rate=rate)
 
 
 def stop_talking(tell_phone=True):
@@ -700,7 +700,9 @@ async def handle_look(photo):
     g = V.gen
     ui("Ты", "[фото] Глянь, чё тут")
     if BRAIN == "polza":
-        return await ask_polza("Глянь, чё тут. Если это задание — реши и скажи ответ.", photo, g, None, framing=2)
+        if await solve_dictate(photo, g, V.listener, allow_other=True):
+            return
+        return await ask_polza("Глянь, чё тут, коротко.", photo, g, None, framing=2)
     await ask([], "Хозяин показывает тебе камеру: глянь, чё тут. Если это задание — реши и скажи ответ.",
               photo, g, None, heard_known="[фото] Глянь, чё тут")
 
@@ -871,7 +873,7 @@ async def solve_task(g, listener):
         if photo is None:
             say("Камера не дала кадр, попробуй ещё раз.")
         return
-    await ask_polza("Реши задание, которое видно на фото.", photo, g, listener, framing=3)
+    await solve_dictate(photo, g, listener)
 POLZA_FORMAT = """
 
 КАК ТЕБЕ ПРИХОДЯТ СООБЩЕНИЯ:
@@ -975,6 +977,8 @@ async def phrase_polza(audio, g, ptt, need_name, listener, T0=None):
     photo = await take_photo() if LOOK.search(text.lower()) else None
     if V.gen != g:
         return
+    if photo and SOLVE_WORDS.search(text.lower()):
+        return await solve_dictate(photo, g, listener)
     await ask_polza(text, photo, g, listener, T0=T0, framing=2 if photo else 0)
 
 
@@ -1072,7 +1076,10 @@ async def ask_polza_audio(wav, g, ptt, need_name, listener, T0):
     if "[ФОТО]" in buf:
         photo = await take_photo()
         if V.gen == g:
-            await ask_polza(heard or "Глянь, что тут.", photo, g, listener, photo_retry=False, T0=T0, framing=2)
+            if photo is not None and SOLVE_WORDS.search((heard or "").lower()):
+                await solve_dictate(photo, g, listener)
+            else:
+                await ask_polza(heard or "Глянь, что тут.", photo, g, listener, photo_retry=False, T0=T0, framing=2)
         return True
     if buf.strip() and V.gen == g:
         speak("Вася", buf.strip(), g)
@@ -1197,6 +1204,199 @@ async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None, framing
         V.phist = V.phist[-config.HISTORY_TURNS * 2:]
         log(f"   Polza: потрачено с запуска ≈ {PZ.spent:.2f} ₽")
 
+# ====================================================================== решение заданий с диктовкой
+SOLVE_WORDS = re.compile(r"(реши|решай|задани|задач|тест|пример|упражнен|ответ|номер|домашк|контрольн|самостоятельн)")
+SOLVE_SYSTEM = "Ты решаешь школьные задания по фото тетради, учебника или доски. Пишешь строго в заданном формате, без разметки."
+SOLVE_FORMAT = """Реши задания на фото и ответь СТРОГО в формате, каждая запись — с новой строки:
+ВИЖУ: номера заданий, которые видно (например 1-11)
+номер|короткий ответ|что записать в тетрадь
+...
+НЕ ВИДНО: номера | куда сдвинуть камеру (ближе, дальше, левее, правее, выше, ниже) — только если что-то обрезано или не читается
+ЕЩЁ: да — только если видно, что заданий дальше больше, чем влезло в кадр
+Правила:
+- Реши ВСЕ видимые номера по порядку, ни один не пропускай.
+- Вариант ответа (А, Б, В, Г) — пиши букву и пару слов самого ответа: «В|В, сионизм|В».
+- Если надо писать развёрнуто (решение задачи, сочинение, определение, перевод) — оформи как требуют в школе
+  (для задач: Дано, Найти, Решение, Ответ) и в третьем поле разбей текст на куски по пять-восемь слов через « / ».
+- Никаких пояснений, звёздочек, списков и лишних слов."""
+SLOW = getattr(config, "DICTATE_RATE", "+0%")   # диктовка — помедленнее обычной речи
+
+
+async def check_written(items, g):
+    """Сфоткать тетрадь и дешёвой моделью проверить, записано ли. Возвращает номера, которые не нашлись."""
+    photo = await take_photo()
+    if photo is None or V.gen != g:
+        return []
+    want = "\n".join(f"{n}) {w}" for n, w in items)
+    msgs = [{"role": "system", "content": "Ты проверяешь тетрадь по фото. Отвечаешь коротко."},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Должно быть записано:\n" + want + "\nДля каждого номера одной строкой: "
+                 "номер|да или номер|нет. Если тетради на фото не видно — напиши только НЕ ВИЖУ."},
+                {"type": "image_url", "image_url": {
+                    "url": "data:image/jpeg;base64," + base64.b64encode(photo).decode(), "detail": "auto"}}]}]
+    out = ""
+    try:
+        async for piece in PZ.chat_stream(CHAT["bg"], msgs, max_tokens=60):
+            out += piece
+    except Exception as e:
+        log("Проверка тетради не вышла:", type(e).__name__, str(e)[:120])
+        return []
+    log("   ✍ проверка:", out.replace("\n", " "))
+    if "НЕ ВИЖУ" in out.upper():
+        return []
+    return [n for n, ans in re.findall(r"(\w+)\s*\|\s*(да|нет)", out, re.I) if ans.lower() == "нет"]
+
+
+def write_pause(text):
+    """Сколько ждать, пока допишешь: ~0.12 с на букву, но не меньше 1.5 и не больше 9 секунд."""
+    return max(1.5, min(9.0, 1.0 + 0.12 * len(text)))
+
+
+async def dictate(items_q, g):
+    """Диктует ответы по одному: медленнее, с паузой на запись; раз в несколько номеров сверяет тетрадь."""
+    group, repeats = [], {}
+    check = getattr(config, "DICTATE_CHECK", True)
+    every = getattr(config, "DICTATE_CHECK_EVERY", 3)
+
+    async def verify(batch):
+        missing = await check_written(batch, g)
+        for n, w in batch:
+            if n in missing and repeats.get(n, 0) < 1 and V.gen == g:
+                repeats[n] = 1
+                speak("Вася", f"Номер {n} не вижу в тетради, повторяю: {w}", g, rate=SLOW)
+                await wait_quiet(write_pause(w))
+
+    while True:
+        it = await items_q.get()
+        if it is None or V.gen != g:
+            break
+        n, ans, write = it
+        chunks = [c.strip() for c in write.split(" / ") if c.strip()] if write else []
+        long_text = len(chunks) > 1 or len(write) > 45
+        speak("Вася", f"Номер {n}: {ans}." if not long_text else f"Номер {n}. Пиши.", g, rate=SLOW)
+        if long_text:
+            await wait_quiet(0.3)
+            for c in chunks:
+                if V.gen != g:
+                    return
+                speak("Вася", c, g, rate=SLOW)
+                await wait_quiet(write_pause(c))
+            if check:
+                await verify([(n, write.replace(" / ", " "))])
+        else:
+            await wait_quiet(write_pause(write or ans))
+            group.append((n, write or ans))
+            if check and len(group) >= every:
+                await verify(group)
+                group = []
+    if check and group and V.gen == g:
+        await verify(group)
+
+
+async def solve_dictate(photo, g, listener, allow_other=False, solved=None, cont=0, retakes=0):
+    """Решить задание с фото компактным списком и продиктовать. False — на фото не задание."""
+    solved = solved or []
+    status("Решаю...")
+    note = SOLVE_FORMAT
+    if allow_other:
+        note += "\nЕсли на фото вообще нет задания — напиши только: НЕ ЗАДАНИЕ"
+    if solved:
+        note += f"\nУже решены номера: {', '.join(solved)} — их пропусти, решай со следующих."
+    msgs = [{"role": "system", "content": SOLVE_SYSTEM},
+            {"role": "user", "content": [{"type": "text", "text": note}, {"type": "image_url", "image_url": {
+                "url": "data:image/jpeg;base64," + base64.b64encode(photo).decode(), "detail": "high"}}]}]
+    items_q = asyncio.Queue()
+    dict_task = None
+    buf, hidden, more, seen, got = "", "", False, "", []
+    T0 = time.time()
+
+    def handle_line(line):
+        nonlocal hidden, more, seen, dict_task
+        line = re.sub(r"[*_#`]", "", line).strip()
+        if not line:
+            return
+        up = line.upper()
+        if up.startswith("ВИЖУ"):
+            seen = re.sub(r"(\d+)\s*[-–—]\s*(\d+)", r"с \1 по \2", line.split(":", 1)[-1].strip())
+            speak("Вася", f"Вижу номера {seen}." if not solved else f"Дальше вижу {seen}.", g)
+        elif up.startswith("НЕ ВИДНО"):
+            hidden = line.split(":", 1)[-1].strip()
+        elif up.startswith("ЕЩЁ") or up.startswith("ЕЩЕ"):
+            more = "да" in line.lower()
+        elif "|" in line:
+            parts = [x.strip() for x in line.split("|")]
+            n = parts[0].strip(" .)№")
+            if n in solved or n in got:
+                return
+            ans = parts[1] if len(parts) > 1 else ""
+            write = parts[2] if len(parts) > 2 else ans
+            got.append(n)
+            if dict_task is None:
+                log(f"   ⏱ первый ответ через {time.time() - T0:.1f} с")
+                dict_task = spawn_task(dictate(items_q, g))
+            items_q.put_nowait((n, ans, write))
+
+    models = list(CHAT["solve"])
+    for i, model in enumerate(models):
+        try:
+            async for piece in PZ.chat_stream(model, msgs, max_tokens=2500):
+                if V.gen != g:
+                    return True
+                buf += piece
+                if "НЕ ЗАДАНИЕ" in buf.upper() and allow_other and not got:
+                    return False
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    handle_line(line)
+            handle_line(buf)
+            break
+        except Exception as e:
+            log(f"Ошибка решения ({model}):", type(e).__name__, str(e)[:200])
+            if got or i + 1 >= len(models) or not polza_retryable(e):
+                if not got:
+                    human, spoken = polza_human(e)
+                    ui("Ошибка", human)
+                    say(spoken)
+                    return True
+                break
+    items_q.put_nowait(None)
+    if dict_task is not None:
+        await dict_task
+    if V.gen != g:
+        return True
+    if not got and not hidden:
+        speak("Вася", "Не разобрал задание, поднеси камеру ближе.", g)
+        return True
+    solved = solved + got
+    log(f"   ✔ решено: {', '.join(got)}; не видно: {hidden or '-'}; ещё: {more}; потрачено ≈ {PZ.spent:.2f} ₽")
+    if hidden and retakes < 2:
+        speak("Вася", f"Номера {hidden.split('|')[0].strip()} не видно. " + (hidden.split("|")[1].strip()
+              if "|" in hidden else "Поправь камеру.").capitalize(), g)
+        status("Поправь камеру...")
+        await wait_quiet(3.0)
+        p = await take_photo()
+        if p is not None and V.gen == g:
+            return await solve_dictate(p, g, listener, solved=solved, cont=cont, retakes=retakes + 1)
+        return True
+    if more and cont < 6:
+        speak("Вася", "Покажи дальше.", g)
+        status("Покажи дальше...")
+        await wait_quiet(4.0)
+        p = await take_photo()
+        if p is not None and V.gen == g:
+            return await solve_dictate(p, g, listener, solved=solved, cont=cont + 1)
+        return True
+    speak("Вася", "Всё, готово.", g)
+    return True
+
+
+def spawn_task(coro):
+    t = asyncio.get_running_loop().create_task(coro)
+    _tasks.add(t)
+    t.add_done_callback(_tasks.discard)
+    return t
+
+
 async def handle_text(text):
     """Запрос текстом — когда говорить вслух неудобно."""
     text = (text or "").strip()[:1000]
@@ -1214,6 +1414,8 @@ async def handle_text(text):
     photo = await take_photo() if LOOK.search(text.lower()) else None
     if V.gen != g:
         return
+    if photo and SOLVE_WORDS.search(text.lower()):
+        return await solve_dictate(photo, g, V.listener)
     await ask_polza(text, photo, g, V.listener, framing=2 if photo else 0)
 
 
@@ -1240,6 +1442,10 @@ async def smart_help():
         audio = audio[-int(30 * SR):]
         if len(audio) < SR * 2:
             audio = None
+    if photo is not None and await solve_dictate(photo, g, V.listener, allow_other=True):
+        return                                   # на фото было задание — решили и продиктовали
+    if V.gen != g:
+        return
     await ask_polza(SMART_PROMPT, photo, g, V.listener, framing=2 if photo else 0, audio_ctx=audio)
 
 
