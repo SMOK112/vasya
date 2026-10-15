@@ -111,6 +111,7 @@ class State:
         self.phist = []              # история для Polza (текстом)
         self.listener = None
         self.mute = False            # «Без звука»: Вася отвечает только текстом на экране
+        self.tts_fail = 0            # сколько фраз подряд сервер не смог озвучить
 
 
 V = State()
@@ -224,7 +225,7 @@ def fire(obj):
 
 
 def ui(who, text):
-    text = MARKS.sub("", text).strip()
+    text = re.sub(r"[*_#`]", "", MARKS.sub("", text)).strip()
     if not text:
         return
     log(f"{who}:", text)
@@ -239,7 +240,7 @@ def status(text):
 import edge_tts
 
 
-MARKS = re.compile(r"\[(ЖДУ|ФОТО|РЕШАЮ|ПЕРЕСНЯТЬ)\]")
+MARKS = re.compile(r"\[(ЖДУ|ФОТО|РЕШАЮ|ПЕРЕСНЯТЬ|ЕЩЁ|ЕЩЕ|РЕШЕНО[^\]]*)\]")
 
 
 def clean_for_tts(text):
@@ -264,36 +265,51 @@ def is_speaking():
     return V.tts_busy or not V.q.empty() or time.time() < V.play_until
 
 
+TTS_SEM = asyncio.Semaphore(2)     # больше 2 разом Microsoft начинает отказывать — и вылезал «второй голос»
+
+
 async def synth_safe(text):
-    """Озвучить фразу; None — если сервер Microsoft не ответил (тогда скажет сам телефон)."""
-    try:
-        t = time.time()
-        mp3 = await asyncio.wait_for(synth(text), 15)
-        log(f"   ⏱ озвучка {time.time() - t:.1f} с")
-        return mp3
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        log("Озвучка на сервере не вышла, пусть говорит телефон:", type(e).__name__, e)
-        return None
+    """Озвучить фразу; None — если сервер Microsoft не ответил даже со второй попытки."""
+    for attempt in (1, 2):
+        try:
+            async with TTS_SEM:
+                t = time.time()
+                mp3 = await asyncio.wait_for(synth(text), 12)
+            log(f"   ⏱ озвучка {time.time() - t:.1f} с")
+            if mp3:
+                V.tts_fail = 0
+                return mp3
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log(f"Озвучка не вышла (попытка {attempt}):", type(e).__name__, e)
+    V.tts_fail += 1
+    return None
 
 
 async def tts_worker():
     """Фразы озвучиваются сразу, параллельно (say запускает синтез), а отправляются строго по порядку."""
     while True:
-        gen, text, task = await V.q.get()
+        gen, text, task, (who, shown) = await V.q.get()
         V.tts_busy = True
         try:
-            if gen != V.gen or task is None:
+            if gen != V.gen:
+                continue
+            if task is None:
+                if who:
+                    ui(who, shown)
                 continue
             mp3 = await task
             if gen != V.gen:
                 continue
+            if who:
+                ui(who, shown)           # текст появляется вместе с голосом, а не раньше
             now = time.time()
             if mp3:
                 if await send(mp3):      # mp3 48 кбит/с — по размеру знаем длительность
                     V.play_until = max(now, V.play_until) + len(mp3) * 8 / 48000 + 0.4
-            elif await send({"type": "speak", "text": text}):
+            elif V.tts_fail >= 3 and await send({"type": "speak", "text": text}):
+                # сервер озвучку совсем не тянет — тогда уж голосом телефона, но не вперемешку
                 V.play_until = max(now, V.play_until) + len(text) / 13 + 0.6
         except asyncio.CancelledError:
             pass
@@ -301,18 +317,24 @@ async def tts_worker():
             V.tts_busy = False
 
 
-def say(text, gen=None):
+def say(text, gen=None, who=None):
+    shown = text
     text = clean_for_tts(text)
     task = None
     if re.search(r"[а-яА-Яa-zA-Z0-9]", text) and not V.mute:
         task = asyncio.get_running_loop().create_task(synth_safe(text))   # синтез стартует сразу
-    V.q.put_nowait((V.gen if gen is None else gen, text, task))
+    V.q.put_nowait((V.gen if gen is None else gen, text, task, (who, shown)))
+
+
+def speak(who, text, gen=None):
+    """Сказать и показать: текст появится на экране, когда начнётся голос (в «Без звука» — сразу)."""
+    say(text, gen, who=who)
 
 
 def stop_talking(tell_phone=True):
     V.gen += 1
     while not V.q.empty():
-        _, _, task = V.q.get_nowait()
+        _, _, task, _ = V.q.get_nowait()
         if task is not None:
             task.cancel()
     V.play_until = 0.0
@@ -575,7 +597,7 @@ def spawn(coro):
 # ====================================================================== мозг
 LOOK = re.compile(r"(глян|гляд|посмотр|смотри|помог|подскаж|прочита|прочти|читай|написан|нарисован|"
                   r"что (тут|там|здесь)|что это за|реши|видишь|на фото|сфоткай|фоткай|камер)")
-SENT_END = re.compile(r"(.+?[.!?…]+)(\s|$)", re.S)
+SENT_END = re.compile(r"(.+?(?<!\d)[.!?…]+)(\s|$)", re.S)   # «1.» и «2.» — не конец фразы
 
 
 def to_wav(audio) -> bytes:
@@ -737,8 +759,7 @@ async def ask(parts, note, photo, g, listener, heard_known=None, photo_retry=Tru
                         break
                     sentence, buf = m.group(1).strip(), buf[m.end():]
                     if sentence:
-                        ui("Вася", sentence)
-                        say(sentence, g)
+                        speak("Вася", sentence, g)
                         answer.append(sentence)
                         said = True
             # поток закончился
@@ -765,8 +786,7 @@ async def ask(parts, note, photo, g, listener, heard_known=None, photo_retry=Tru
                 status("Слушаю! Говори")
                 return
             if buf.strip() and V.gen == g:
-                ui("Вася", buf.strip())
-                say(buf.strip(), g)
+                speak("Вася", buf.strip(), g)
                 answer.append(buf.strip())
             break
         except Exception as e:
@@ -816,9 +836,18 @@ OFFER_LINES = ["Опа, вижу задание. Решаем или сам бу
 OFFER_NOTE = (" Ты только что заметил камерой задание и спросил хозяина, решать ли его. "
               "Если он согласен (да, давай, го, ага, реши, конечно и тому подобное) — ответь только «[РЕШАЮ]». "
               "Если отказывается — коротко и смешно ответь.")
-FRAMING_RULE = (" Если задание на фото видно не целиком, обрезано, размыто или слишком мелко, чтобы прочитать, — не решай, "
-                "а одной-двумя фразами скажи, как сдвинуть камеру (ближе, дальше, левее, правее, выше, ниже), "
-                "и в самом конце поставь «[ПЕРЕСНЯТЬ]». Если всё видно — реши: сначала ответ, потом коротко как.")
+FRAMING_RULE = ("""
+
+ЕСЛИ НА ФОТО ЗАДАНИЕ, ТЕСТ ИЛИ ПРИМЕРЫ — отвечай строго так:
+1) Сначала одной фразой — какие номера видишь, например: «Вижу номера с первого по четвёртый».
+2) Потом по каждому видимому номеру одной строкой: «Номер один — ответ: Б, сионизм.» — только ответ и то, что надо
+   записать в тетрадь. Без объяснений, если не просили. Никаких звёздочек, жирного шрифта и списков вида «1.».
+3) Если какой-то номер обрезан, размыт или слишком мелкий — его не решай, а скажи, как сдвинуть камеру
+   (ближе, дальше, левее, правее, выше, ниже), и поставь в конце «[ПЕРЕСНЯТЬ]».
+4) Если видно, что номеров дальше больше (текст уходит за край, номера продолжаются) — после ответов скажи
+   «Покажи дальше» и поставь «[ЕЩЁ]».
+5) В самом конце поставь «[РЕШЕНО: номера, которые решил, через запятую]».
+Если на фото не задание — просто ответь по делу.""")
 
 
 def offer_pending():
@@ -1009,8 +1038,7 @@ async def ask_polza_audio(wav, g, ptt, need_name, listener, T0):
                     if first:
                         log(f"   ⏱ первая фраза ответа через {time.time() - T0:.1f} с ({model}, звук напрямую)")
                         first = False
-                    ui("Вася", sentence)
-                    say(sentence, g)
+                    speak("Вася", sentence, g)
                     answer.append(sentence)
     except PolzaError as e:
         if e.status == 400 and not answer:
@@ -1047,8 +1075,7 @@ async def ask_polza_audio(wav, g, ptt, need_name, listener, T0):
             await ask_polza(heard or "Глянь, что тут.", photo, g, listener, photo_retry=False, T0=T0, framing=2)
         return True
     if buf.strip() and V.gen == g:
-        ui("Вася", buf.strip())
-        say(buf.strip(), g)
+        speak("Вася", buf.strip(), g)
         answer.append(buf.strip())
     if answer and V.gen == g:
         V.phist += [{"role": "user", "content": heard or "(голосовое)"},
@@ -1058,11 +1085,15 @@ async def ask_polza_audio(wav, g, ptt, need_name, listener, T0):
     return True
 
 
-async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None, framing=0, offered=False, audio_ctx=None):
+async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None, framing=0, offered=False, audio_ctx=None,
+                    cont=0, solved=""):
     T0 = T0 or time.time()
     first = True
-    prompt_text = text + (FRAMING_RULE if photo and framing > 1 else
-                          " Это уже поправленный кадр — реши по тому, что видно." if photo and framing == 1 else "")
+    prompt_text = text + (FRAMING_RULE if photo and framing >= 1 else "")
+    if photo and framing == 1:
+        prompt_text += "\nЭто уже поправленный кадр — реши всё, что можно разобрать, пересъёмку больше не проси."
+    if photo and solved:
+        prompt_text += f"\nУже решены номера: {solved}. Их не повторяй — продолжай со следующих."
     if offered:
         prompt_text += OFFER_NOTE
     if time.time() - V.last > config.NEW_SESSION_AFTER_S:
@@ -1089,7 +1120,8 @@ async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None, framing
     while i < len(models):
         buf = ""
         try:
-            async for piece in PZ.chat_stream(models[i], messages, max_tokens=config.ANSWER_MAX_TOKENS,
+            async for piece in PZ.chat_stream(models[i], messages,
+                                              max_tokens=900 if photo else config.ANSWER_MAX_TOKENS,
                                               web_search=config.POLZA_WEB_SEARCH):
                 if V.gen != g:
                     return
@@ -1105,8 +1137,7 @@ async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None, framing
                         if first:
                             log(f"   ⏱ первая фраза ответа через {time.time() - T0:.1f} с ({models[i]})")
                             first = False
-                        ui("Вася", sentence)
-                        say(sentence, g)
+                        speak("Вася", sentence, g)
                         answer.append(sentence)
                         said = True
             break
@@ -1133,10 +1164,12 @@ async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None, framing
                 return await ask_polza(text, p, g, listener, photo_retry=False, framing=2)
         buf = buf.replace("[ФОТО]", "")
     if buf.strip() and V.gen == g:
-        ui("Вася", buf.strip())
-        say(buf.strip(), g)
+        speak("Вася", buf.strip(), g)
         answer.append(buf.strip())
     full = " ".join(answer) + " " + buf
+    m = re.search(r"\[РЕШЕНО:?([^\]]*)\]", full)
+    if m and m.group(1).strip():
+        solved = ", ".join(x for x in [solved, m.group(1).strip()] if x)
     if "[ПЕРЕСНЯТЬ]" in full and photo is not None and framing > 1 and V.gen == g:
         # Вася сказал, как поправить камеру — ждём, пока договорит и ты поправишь, и снимаем снова
         status("Поправь камеру...")
@@ -1145,7 +1178,18 @@ async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None, framing
             return
         p = await take_photo()
         if p is not None and V.gen == g:
-            return await ask_polza(text, p, g, listener, framing=framing - 1, audio_ctx=audio_ctx)
+            return await ask_polza(text, p, g, listener, framing=framing - 1, audio_ctx=audio_ctx,
+                                   cont=cont, solved=solved)
+        return
+    if re.search(r"\[ЕЩ[ЁЕ]\]", full) and photo is not None and cont < 6 and V.gen == g:
+        # заданий больше, чем влезло, — ждём, пока покажешь следующую часть, и продолжаем с того места
+        status("Покажи дальше...")
+        await wait_quiet(4.0)
+        if V.gen != g:
+            return
+        p = await take_photo()
+        if p is not None and V.gen == g:
+            return await ask_polza(text, p, g, listener, framing=2, cont=cont + 1, solved=solved)
         return
     if answer and V.gen == g:
         V.phist += [{"role": "user", "content": text + (" [показал фото]" if photo else "")},
@@ -1229,11 +1273,9 @@ async def reply_help(g, listener):
                 sentence, buf = m.group(1).strip(), buf[m.end():]
                 if sentence:
                     first = False
-                    ui("Суфлёр", sentence)
-                    say(sentence, g)
+                    speak("Суфлёр", sentence, g)
         if buf.strip() and V.gen == g:
-            ui("Суфлёр", buf.strip())
-            say(buf.strip(), g)
+            speak("Суфлёр", buf.strip(), g)
     except Exception as e:
         log("Суфлёр: ошибка:", type(e).__name__, str(e)[:200])
         human, spoken = polza_human(e)
@@ -1271,8 +1313,7 @@ async def handle_bg(data_url):
             if V.listener is not None:
                 V.listener.awake_until = now + 15     # ответ «да/нет» — без имени
             line = random.choice(OFFER_LINES)
-            ui("Вася", line)
-            say(line)
+            speak("Вася", line)
     except Exception as e:
         log("Фон: не вышло:", type(e).__name__, str(e)[:150])
     finally:
