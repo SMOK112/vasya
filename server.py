@@ -110,6 +110,7 @@ class State:
         self.greeted = 0.0
         self.phist = []              # история для Polza (текстом)
         self.listener = None
+        self.mute = False            # «Без звука»: Вася отвечает только текстом на экране
 
 
 V = State()
@@ -303,7 +304,7 @@ async def tts_worker():
 def say(text, gen=None):
     text = clean_for_tts(text)
     task = None
-    if re.search(r"[а-яА-Яa-zA-Z0-9]", text):
+    if re.search(r"[а-яА-Яa-zA-Z0-9]", text) and not V.mute:
         task = asyncio.get_running_loop().create_task(synth_safe(text))   # синтез стартует сразу
     V.q.put_nowait((V.gen if gen is None else gen, text, task))
 
@@ -1057,7 +1058,7 @@ async def ask_polza_audio(wav, g, ptt, need_name, listener, T0):
     return True
 
 
-async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None, framing=0, offered=False):
+async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None, framing=0, offered=False, audio_ctx=None):
     T0 = T0 or time.time()
     first = True
     prompt_text = text + (FRAMING_RULE if photo and framing > 1 else
@@ -1070,6 +1071,9 @@ async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None, framing
     mode = ("\n\nСЕЙЧАС ВКЛЮЧЁН ПРИЛИЧНЫЙ РЕЖИМ: никакого мата, общайся вежливо, но с юмором."
             if V.polite else "\n\nРЕЖИМ БЕЗ ЦЕНЗУРЫ: общайся в стиле, описанном выше.")
     content = [{"type": "text", "text": prompt_text}]
+    if audio_ctx is not None and PZ.audio_in.get((CHAT["solve"] if photo else CHAT["models"])[0]):
+        content.append({"type": "input_audio", "input_audio": {
+            "data": base64.b64encode(to_wav(audio_ctx)).decode(), "format": "wav"}})
     if photo:
         content.append({"type": "image_url", "image_url": {
             "url": "data:image/jpeg;base64," + base64.b64encode(photo).decode(), "detail": "high"}})
@@ -1141,13 +1145,59 @@ async def ask_polza(text, photo, g, listener, photo_retry=True, T0=None, framing
             return
         p = await take_photo()
         if p is not None and V.gen == g:
-            return await ask_polza(text, p, g, listener, framing=framing - 1)
+            return await ask_polza(text, p, g, listener, framing=framing - 1, audio_ctx=audio_ctx)
         return
     if answer and V.gen == g:
         V.phist += [{"role": "user", "content": text + (" [показал фото]" if photo else "")},
                     {"role": "assistant", "content": MARKS.sub("", " ".join(answer))}]
         V.phist = V.phist[-config.HISTORY_TURNS * 2:]
         log(f"   Polza: потрачено с запуска ≈ {PZ.spent:.2f} ₽")
+
+async def handle_text(text):
+    """Запрос текстом — когда говорить вслух неудобно."""
+    text = (text or "").strip()[:1000]
+    if not text:
+        return
+    stop_talking()
+    g = V.gen
+    ui("Ты", text)
+    if handle_command(text):
+        return
+    if BRAIN != "polza":
+        return await ask([], "Хозяин написал текстом: " + text, None, g, None, heard_known=text)
+    if offer_pending():
+        return await ask_polza(text, None, g, V.listener, offered=True)
+    photo = await take_photo() if LOOK.search(text.lower()) else None
+    if V.gen != g:
+        return
+    await ask_polza(text, photo, g, V.listener, framing=2 if photo else 0)
+
+
+SMART_PROMPT = ("Хозяин нажал кнопку «Разберись» — вслух он сейчас говорить не может. Посмотри на фото с камеры "
+                "(и послушай последние секунды звука вокруг, если они есть) и сам пойми, чем помочь: "
+                "если в кадре задание, пример, тест или вопрос — реши, сначала ответ; "
+                "если там текст — коротко перескажи главное; "
+                "если ему только что что-то сказали или спросили — подскажи, что ответить, прямой репликой от его лица; "
+                "если ничего такого — одной фразой скажи, что видишь, и спроси, чем помочь. Коротко.")
+
+
+async def smart_help():
+    """Кнопка «Разберись»: фото + последние секунды вокруг, Вася сам понимает, что нужно."""
+    if BRAIN != "polza":
+        return
+    stop_talking()
+    g = V.gen
+    ui("Ты", "[Разберись]")
+    photo = await take_photo()
+    if V.gen != g:
+        return
+    audio = V.listener.context_audio() if V.listener is not None else None
+    if audio is not None:
+        audio = audio[-int(30 * SR):]
+        if len(audio) < SR * 2:
+            audio = None
+    await ask_polza(SMART_PROMPT, photo, g, V.listener, framing=2 if photo else 0, audio_ctx=audio)
+
 
 async def reply_help(g, listener):
     """Хозяину трудно в разговоре — берём последние секунды вокруг и подсказываем, что ответить."""
@@ -1287,6 +1337,15 @@ async def ws_handler(request):
                 elif t == "idle":
                     if not V.tts_busy and V.q.empty():
                         V.play_until = min(V.play_until, time.time() + 0.2)
+                elif t == "text":
+                    spawn(handle_text(m.get("text", "")))
+                elif t == "smart":
+                    spawn(smart_help())
+                elif t == "mute":
+                    V.mute = bool(m.get("on"))
+                    if V.mute:
+                        stop_talking(tell_phone=True)
+                    log("Без звука:", V.mute)
                 elif t == "bg":
                     if BRAIN == "polza" and not is_speaking():
                         spawn(handle_bg(m.get("data")))
