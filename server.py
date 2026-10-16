@@ -706,6 +706,16 @@ async def handle_phrase(audio, ptt=False, wake_hit=False, need_name=False, quiet
     await ask([types.Part.from_bytes(data=to_wav(audio), mime_type="audio/wav")], note, photo, g, listener)
 
 
+async def handle_look_from_selected_camera():
+    # Explicit tap on Look: obtain a fresh photo from the selected camera.
+    photo = await take_photo()
+    if photo is None:
+        status("Не удалось получить фото")
+        return
+    stop_talking()
+    await handle_look(photo)
+
+
 async def handle_look(photo):
     stop_talking()
     g = V.gen
@@ -1599,6 +1609,9 @@ async def ws_handler(request):
                     spawn(handle_text(m.get("text", "")))
                 elif t == "smart":
                     spawn(smart_help())
+                elif t == "look":
+                    # The same photo analysis works with the phone or the glasses.
+                    spawn(solve_task(V.gen, V.listener)) if False else spawn(handle_look_from_selected_camera())
                 elif t == "glasses_select":
                     V.glasses_enabled = bool(m.get("on"))
                     fire({"type": "glasses_status", "selected": V.glasses_enabled,
