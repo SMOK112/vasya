@@ -73,10 +73,15 @@ class GlassesBridge:
         if request.content_length is not None and request.content_length > MAX_JPEG_BYTES:
             raise web.HTTPRequestEntityTooLarge(max_size=MAX_JPEG_BYTES,
                                                 actual_size=request.content_length)
-        image = await request.content.read(MAX_JPEG_BYTES + 1)
-        if len(image) > MAX_JPEG_BYTES:
-            raise web.HTTPRequestEntityTooLarge(max_size=MAX_JPEG_BYTES,
-                                                actual_size=len(image))
+        chunks = []
+        size = 0
+        async for chunk in request.content.iter_chunked(65536):
+            size += len(chunk)
+            if size > MAX_JPEG_BYTES:
+                raise web.HTTPRequestEntityTooLarge(
+                    max_size=MAX_JPEG_BYTES, actual_size=size)
+            chunks.append(chunk)
+        image = b"".join(chunks)
         if len(image) < 1024 or not image.startswith(b"\xff\xd8") or not image.endswith(b"\xff\xd9"):
             raise web.HTTPBadRequest(text="Invalid or incomplete JPEG")
         future.set_result(image)
