@@ -1611,7 +1611,7 @@ async def ws_handler(request):
                     spawn(smart_help())
                 elif t == "look":
                     # The same photo analysis works with the phone or the glasses.
-                    spawn(solve_task(V.gen, V.listener)) if False else spawn(handle_look_from_selected_camera())
+                    spawn(handle_look_from_selected_camera())
                 elif t == "glasses_select":
                     V.glasses_enabled = bool(m.get("on"))
                     fire({"type": "glasses_status", "selected": V.glasses_enabled,
