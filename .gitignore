@@ -3,3 +3,4 @@ venv/
 __pycache__/
 models/vosk-model-*
 *.zip
+firmware/GlassesBridge/secrets.h
