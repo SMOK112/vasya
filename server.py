@@ -22,6 +22,7 @@ import wave
 
 import numpy as np
 from aiohttp import web, WSMsgType
+from glasses_bridge import GlassesBridge
 
 import config
 
@@ -115,6 +116,8 @@ class State:
 
 
 V = State()
+GLASSES = GlassesBridge()
+V.glasses_enabled = False  # explicit user choice, default to phone
 
 
 def gen_config():
@@ -612,6 +615,14 @@ def to_wav(audio) -> bytes:
 
 
 async def take_photo(timeout=10.0):
+    # Glasses are opt-in. Never expose their local camera on the public internet.
+    # On failure fall back to existing phone capture path.
+    if V.glasses_enabled and GLASSES.online():
+        status("Снимаю очками...")
+        image = await GLASSES.capture_photo(timeout=20.0)
+        if image is not None:
+            return image
+        status("Очки недоступны, пробую камеру телефона...")
     if V.ws is None:
         return None
     V.snap_id += 1
@@ -693,6 +704,16 @@ async def handle_phrase(audio, ptt=False, wake_hit=False, need_name=False, quiet
     note += (" Отвечай, только если он обратился к тебе по имени Вася, иначе «Я: -»."
              if need_name else " Он обращается к тебе.")
     await ask([types.Part.from_bytes(data=to_wav(audio), mime_type="audio/wav")], note, photo, g, listener)
+
+
+async def handle_look_from_selected_camera():
+    # Explicit tap on Look: obtain a fresh photo from the selected camera.
+    photo = await take_photo()
+    if photo is None:
+        status("Не удалось получить фото")
+        return
+    stop_talking()
+    await handle_look(photo)
 
 
 async def handle_look(photo):
@@ -1588,6 +1609,17 @@ async def ws_handler(request):
                     spawn(handle_text(m.get("text", "")))
                 elif t == "smart":
                     spawn(smart_help())
+                elif t == "look":
+                    # The same photo analysis works with the phone or the glasses.
+                    spawn(handle_look_from_selected_camera())
+                elif t == "glasses_select":
+                    V.glasses_enabled = bool(m.get("on"))
+                    fire({"type": "glasses_status", "selected": V.glasses_enabled,
+                          "online": GLASSES.online()})
+                    status("Камера очков выбрана" if V.glasses_enabled else "Камера телефона выбрана")
+                elif t == "glasses_status":
+                    fire({"type": "glasses_status", "selected": V.glasses_enabled,
+                          "online": GLASSES.online()})
                 elif t == "mute":
                     V.mute = bool(m.get("on"))
                     if V.mute:
@@ -1632,6 +1664,7 @@ def main():
     app.router.add_get("/", index)
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/check", check)
+    GLASSES.register(app)
     app.on_startup.append(on_startup)
     log(f"Вася слушает на {HOST}:{PORT}")
     web.run_app(app, host=HOST, port=PORT, access_log=None, print=None)
